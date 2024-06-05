@@ -1,0 +1,23 @@
+[package]
+name = "sqc"
+version = "0.1.0"
+edition = "2018"
+
+[lib]
+name = "sqc"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+datafusion-common = "38"
+datafusion-expr = "38"
+datafusion-sql = "38"
+derive_more = "0.99"
+pyo3 = "0.21"
+pyo3-log = "0.10"
+log = { version = "0.4", features = ["release_max_level_off"] }
+thiserror = "1"
+
+[dev-dependencies]
+rstest = { version = "0.21", default-features = false }
+pyo3 = { version = "0.21", features = ["auto-initialize"] }
+test-log = { version = "0.2", features = ["log"] }
