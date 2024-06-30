@@ -135,3 +135,22 @@ fn test_order_by(issues: &PyObject) {
     ]);
     py_assert_eq!(result, expected);
 }
+
+#[rstest]
+fn test_function_call(users: &PyObject) {
+    let query = r#"
+    SELECT id, login
+    FROM users
+    WHERE length(login) > 15
+    LIMIT 3
+    "#;
+
+    let tables = py!({"users": users});
+    let result = sqc::query(query, Some(tables.into())).unwrap();
+    let expected = py!([
+        {"id": 121686, "login": "JohnathonReasons"},
+        {"id": 368838, "login": "fredrik-johansson"},
+        {"id": 564592, "login": "HeinrichApfelmus"},
+    ]);
+    py_assert_eq!(result, expected);
+}

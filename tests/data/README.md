@@ -145,3 +145,24 @@ def load_tables():
 
 tables = load_tables()
 ```
+
+### Clickhouse
+
+```bash
+docker cp ./tests/data <container>:/var/lib/clickhouse/user_files/github
+```
+
+```sql
+create database github;
+
+create table github.comments as file('github/comments.json', 'JSONEachRow');
+create table github.events as file('github/events.json', 'JSONEachRow');
+create table github.forks as file('github/forks.json', 'JSONEachRow');
+create table github.issues as file('github/issues.json', 'JSONEachRow');
+create table github.milestones as file('github/milestones.json', 'JSONEachRow');
+create table github.organizations as file('github/organizations.json', 'JSONEachRow');
+create table github.pull_requests as file('github/pull_requests.json', 'JSONEachRow');
+create table github.releases as file('github/releases.json', 'JSONEachRow');
+create table github.repositories as file('github/repositories.json', 'JSONEachRow');
+create table github.users as file('github/users.json', 'JSONEachRow');
+```

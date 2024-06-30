@@ -10,6 +10,8 @@ mod explain;
 mod logical_plan;
 mod parser;
 mod planner;
+mod stream;
+mod functions;
 
 pub use executor::{execute_plan, ExecutionContext};
 pub use parser::parse_query;
@@ -47,7 +49,7 @@ pub fn query(query: &str, data: Option<PyObject>) -> PyResult<PyObject> {
             };
         }
 
-        let stream = execute_plan(py, &plan, &ctx).map_err(PyErr::from)?;
+        let stream = execute_plan(py, &plan, &mut ctx).map_err(PyErr::from)?;
 
         stream
             .map(|row| {

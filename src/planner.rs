@@ -1,5 +1,5 @@
 use itertools::Itertools;
-use std::any::Any;
+use std::{any::Any, sync::Arc};
 
 use indexmap::IndexMap;
 use pyo3::prelude::*;
@@ -278,9 +278,39 @@ impl Visitor {
                     .build()?
                     .into()
             }
+            ast::Expr::Function(function) => {
+                if function.name.to_string().to_lowercase() == "length" {
+                    ScalarFunction {
+                        func: Arc::new(crate::functions::scalar::Length),
+                        args: self.visit_function_arguments(&function.args)?,
+                    }
+                    .into()
+                } else {
+                    unimplemented!("{function}")
+                }
+            }
             _ => unimplemented!("{expr:?}"),
         };
         Ok(result)
+    }
+
+    fn visit_function_arguments(&self, args: &ast::FunctionArguments) -> PlanResult<Vec<Expr>> {
+        match args {
+            ast::FunctionArguments::None => Ok(vec![]),
+            ast::FunctionArguments::Subquery(_) => todo!(),
+            ast::FunctionArguments::List(arg_list) => arg_list
+                .args
+                .iter()
+                .map(|a| match a {
+                    ast::FunctionArg::Named { .. } => todo!(),
+                    ast::FunctionArg::Unnamed(unnamed) => match unnamed {
+                        ast::FunctionArgExpr::Expr(e) => self.visit_expr(e),
+                        ast::FunctionArgExpr::QualifiedWildcard(_) => todo!(),
+                        ast::FunctionArgExpr::Wildcard => todo!(),
+                    },
+                })
+                .collect(),
+        }
     }
 
     fn visit_unary_op(&self, op: &ast::UnaryOperator) -> PlanResult<Operator> {

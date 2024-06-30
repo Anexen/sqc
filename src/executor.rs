@@ -9,8 +9,10 @@ use itertools::Itertools;
 use pyo3::{prelude::*, types::*};
 
 use crate::logical_plan::*;
+use crate::stream::*;
 
 type ExecResult<T> = Result<T, ExecError>;
+type Stream<'p> = crate::stream::Stream<'p, ExecError>;
 
 #[derive(Debug, Display)]
 pub enum ExecError {
@@ -28,14 +30,6 @@ impl From<PyErr> for ExecError {
 
 pub struct ExecutionContext {
     tables: HashMap<String, PyObject>,
-}
-
-macro_rules! stream {
-    ($iter:expr) => {
-        Stream {
-            inner: Box::new($iter.into_iter()),
-        }
-    };
 }
 
 impl Default for ExecutionContext {
@@ -80,40 +74,24 @@ impl ExecutionContext {
             Err(e) => Err(ExecError::RuntimeError(e.to_string().into())),
         });
 
-        Ok(stream!(stream))
-    }
-}
-
-type RowData = IndexMap<String, PyObject>;
-type RowInner = HashMap<TableReference, RowData>;
-type Row = Result<RowInner, ExecError>;
-
-pub struct Stream<'s> {
-    inner: Box<dyn Iterator<Item = Row> + 's>,
-}
-
-impl Iterator for Stream<'_> {
-    type Item = Row;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        Ok(Stream::new(stream))
     }
 }
 
 pub fn execute_plan<'p>(
     py: Python<'p>,
     plan: &'p LogicalPlan,
-    ctx: &'p ExecutionContext,
+    ctx: &'p mut ExecutionContext,
 ) -> ExecResult<Stream<'p>> {
     plan.execute(py, ctx)
 }
 
 trait Exec<'p> {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>>;
+    fn execute(&'p self, py: Python<'p>, ctx: &'p mut ExecutionContext) -> ExecResult<Stream<'p>>;
 }
 
 impl<'p> Exec<'p> for LogicalPlan {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>> {
+    fn execute(&'p self, py: Python<'p>, ctx: &'p mut ExecutionContext) -> ExecResult<Stream<'p>> {
         match self {
             LogicalPlan::Projection(v) => v.execute(py, ctx),
             LogicalPlan::TableScan(v) => v.execute(py, ctx),
@@ -128,7 +106,7 @@ impl<'p> Exec<'p> for LogicalPlan {
 }
 
 impl<'p> Exec<'p> for Projection {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>> {
+    fn execute(&'p self, py: Python<'p>, ctx: &'p mut ExecutionContext) -> ExecResult<Stream<'p>> {
         let data = self.input.execute(py, ctx)?.map_ok(move |row| {
             let data = self.expr.iter().flat_map(|(name, expr)| match expr {
                 Expr::Wildcard(wildcard) => match wildcard.table.as_ref() {
@@ -155,25 +133,27 @@ impl<'p> Exec<'p> for Projection {
             [(TableReference::default(), part)].into()
         });
 
-        Ok(stream!(data))
+        Ok(Stream::new(data))
     }
 }
 
 impl<'p> Exec<'p> for TableScan {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>> {
-        let stream = ctx.scan_table(py, &self.table_name)?;
-        // .filter(move |row| {
-        //     self.filters
-        //         .iter()
-        //         .all(|f| evaluate_predicate(py, f, row.as_unbound()).unwrap())
-        // })
+    fn execute(&'p self, py: Python<'p>, ctx: &'p mut ExecutionContext) -> ExecResult<Stream<'p>> {
+        let stream = ctx
+            .scan_table(py, &self.table_name)?
+            .filter_then(move |row| {
+                self.filters
+                    .iter()
+                    .map(Ok)
+                    .and_all(|expr| evaluate_predicate(py, expr, row))
+            });
 
-        Ok(stream!(stream))
+        Ok(Stream::new(stream))
     }
 }
 
 impl<'p> Exec<'p> for Sort {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>> {
+    fn execute(&'p self, py: Python<'p>, ctx: &'p mut ExecutionContext) -> ExecResult<Stream<'p>> {
         let mut input: Vec<_> = self.input.execute(py, ctx)?.try_collect()?;
 
         let mut indices: Vec<_> = input
@@ -212,18 +192,18 @@ impl<'p> Exec<'p> for Sort {
             input.swap(i, index);
         }
 
-        Ok(stream!(input.into_iter().map(Ok)))
+        Ok(Stream::new(input.into_iter().map(Ok)))
     }
 }
 
 impl<'p> Exec<'p> for Join {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>> {
+    fn execute(&'p self, py: Python<'p>, ctx: &'p mut ExecutionContext) -> ExecResult<Stream<'p>> {
         let left: Vec<_> = self.left.execute(py, ctx)?.collect();
         let right: Vec<_> = self.right.execute(py, ctx)?.collect();
 
         let hash_table: BTreeMap<_, _> = right
             .into_iter()
-            .map_ok(|x| {
+            .map_then(|x| {
                 let join_keys = self
                     .on
                     .iter()
@@ -233,8 +213,8 @@ impl<'p> Exec<'p> for Join {
                     .collect_vec();
 
                 let value = PyTuple::new_bound(py, join_keys);
-                let key = value.hash().unwrap();
-                (key, x)
+                let key = value.hash()?;
+                Ok((key, x))
             })
             .try_collect()?;
 
@@ -258,42 +238,46 @@ impl<'p> Exec<'p> for Join {
             Some(result)
         });
 
-        Ok(stream!(stream))
+        Ok(Stream::new(stream))
     }
 }
 
 impl<'p> Exec<'p> for SubqueryAlias {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>> {
-        let data = self.input.execute(py, ctx)?.map_ok(|row| {
-            row.into_values().map(|v| (self.alias.clone(), v))
-                .collect()
-        });
-        Ok(stream!(data))
+    fn execute(&'p self, py: Python<'p>, ctx: &'p mut ExecutionContext) -> ExecResult<Stream<'p>> {
+        let data = self
+            .input
+            .execute(py, ctx)?
+            .map_ok(|row| row.into_values().map(|v| (self.alias.clone(), v)).collect());
+        Ok(Stream::new(data))
     }
 }
 
 impl<'p> Exec<'p> for Filter {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>> {
-        let data = self.input.execute(py, ctx)?.filter_ok(move |row| {
-            let result = evaluate_predicate(py, &self.predicate, row);
-            result.unwrap()
-        });
+    fn execute(&'p self, py: Python<'p>, ctx: &'p mut ExecutionContext) -> ExecResult<Stream<'p>> {
+        let data = self
+            .input
+            .execute(py, ctx)?
+            .filter_then(move |row| evaluate_predicate(py, &self.predicate, row));
 
-        Ok(stream!(data))
+        Ok(Stream::new(data))
     }
 }
 
 impl<'p> Exec<'p> for EmptyRelation {
-    fn execute(&'p self, _py: Python<'p>, _ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>> {
+    fn execute(
+        &'p self,
+        _py: Python<'p>,
+        _ctx: &'p mut ExecutionContext,
+    ) -> ExecResult<Stream<'p>> {
         let table_ref = TableReference::default();
         let row = [(table_ref, IndexMap::new())].into();
         let data = vec![Ok(row)];
-        Ok(stream!(data))
+        Ok(Stream::new(data))
     }
 }
 
 impl<'p> Exec<'p> for Limit {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> ExecResult<Stream<'p>> {
+    fn execute(&'p self, py: Python<'p>, ctx: &'p mut ExecutionContext) -> ExecResult<Stream<'p>> {
         let limit = evaluate_scalar_expr(py, &self.limit, &Default::default())?
             .into_bound(py)
             .extract::<usize>()?;
@@ -311,7 +295,7 @@ impl<'p> Exec<'p> for Limit {
 
         let stream = self.input.execute(py, ctx)?.skip(offset).take(limit);
 
-        Ok(stream!(stream))
+        Ok(Stream::new(stream))
     }
 }
 
@@ -401,6 +385,15 @@ fn evaluate_scalar_expr(py: Python, expr: &Expr, row: &RowInner) -> ExecResult<S
             };
 
             Ok(result.into())
+        }
+        Expr::ScalarFunction(f) => {
+            let args: Vec<_> = f
+                .args
+                .iter()
+                .map(|a| evaluate_scalar_expr(py, a, row))
+                .try_collect()?;
+
+            f.func.invoke(&args)
         }
         _ => todo!(),
     }

@@ -2,6 +2,7 @@ use derive_builder::{Builder, UninitializedFieldError};
 use derive_more::{Display, Error, From};
 use derive_visitor::Drive;
 use indexmap::IndexMap;
+use itertools::Itertools;
 use pyo3::prelude::*;
 use pyo3::types::PyNone;
 use std::fmt;
@@ -119,38 +120,38 @@ impl ScalarValue {
         }
     }
 }
-
-impl PartialEq for ScalarValue {
-    fn eq(&self, other: &Self) -> bool {
-        Python::with_gil(|py| {
-            if let (Some(a), Some(b)) = (self.0.as_ref(), other.0.as_ref()) {
-                a.bind(py).eq(b.bind(py)).unwrap_or(false)
-            } else {
-                false
-            }
-        })
-    }
-}
-
-impl Eq for ScalarValue {}
-
-impl PartialOrd for ScalarValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Python::with_gil(|py| match (self.0.as_ref(), other.0.as_ref()) {
-            (Some(a), Some(b)) => a.bind(py).compare(b.bind(py)).ok(),
-            _ => todo!(),
-        })
-    }
-}
-
-impl Ord for ScalarValue {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        Python::with_gil(|py| match (self.0.as_ref(), other.0.as_ref()) {
-            (Some(a), Some(b)) => a.bind(py).compare(b.bind(py)).unwrap(),
-            _ => todo!(),
-        })
-    }
-}
+//
+// impl PartialEq for ScalarValue {
+//     fn eq(&self, other: &Self) -> bool {
+//         Python::with_gil(|py| {
+//             if let (Some(a), Some(b)) = (self.0.as_ref(), other.0.as_ref()) {
+//                 a.bind(py).eq(b.bind(py)).unwrap_or(false)
+//             } else {
+//                 false
+//             }
+//         })
+//     }
+// }
+//
+// impl Eq for ScalarValue {}
+//
+// impl PartialOrd for ScalarValue {
+//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+//         Python::with_gil(|py| match (self.0.as_ref(), other.0.as_ref()) {
+//             (Some(a), Some(b)) => a.bind(py).compare(b.bind(py)).ok(),
+//             _ => todo!(),
+//         })
+//     }
+// }
+//
+// impl Ord for ScalarValue {
+//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+//         Python::with_gil(|py| match (self.0.as_ref(), other.0.as_ref()) {
+//             (Some(a), Some(b)) => a.bind(py).compare(b.bind(py)).unwrap(),
+//             _ => todo!(),
+//         })
+//     }
+// }
 
 impl From<PyObject> for ScalarValue {
     fn from(value: PyObject) -> Self {
@@ -265,7 +266,31 @@ pub enum Expr {
     Literal(ScalarValue),
     UnaryExpr(UnaryExpr),
     BinaryExpr(BinaryExpr),
+    ScalarFunction(ScalarFunction),
     Wildcard(Wildcard),
+}
+
+#[derive(Clone)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct ScalarFunction {
+    pub func: Arc<dyn ScalarFunctionImpl>,
+    pub args: Vec<Expr>,
+}
+
+impl fmt::Display for ScalarFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}({})",
+            self.func.name(),
+            self.args.iter().map(|e| e.to_string()).join(", ")
+        )
+    }
+}
+
+pub trait ScalarFunctionImpl: std::fmt::Debug {
+    fn name(&self) -> &str;
+    fn invoke(&self, args: &[ScalarValue]) -> Result<ScalarValue, crate::executor::ExecError>;
 }
 
 #[derive(Clone, Display, Builder)]
@@ -416,6 +441,7 @@ impl Expr {
                 binary_expr.right.extract_columns_impl(columns);
                 binary_expr.left.extract_columns_impl(columns);
             }
+            Expr::ScalarFunction(f) => f.args.iter().for_each(|a| a.extract_columns_impl(columns)),
             Expr::Wildcard(_) => todo!(),
         };
     }
