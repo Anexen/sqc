@@ -1,12 +1,10 @@
 use derive_builder::{Builder, UninitializedFieldError};
 use derive_more::{Display, Error, From};
-use derive_visitor::Drive;
 use indexmap::IndexMap;
 use itertools::Itertools;
-use pyo3::prelude::*;
-use pyo3::types::PyNone;
+use pyo3::PyObject;
 use std::fmt;
-use std::sync::Arc;
+use std::rc::Rc;
 
 #[derive(Debug, Error, Display)]
 #[display(fmt = "{_0}")]
@@ -18,7 +16,7 @@ impl From<UninitializedFieldError> for PlanError {
     }
 }
 
-#[derive(Clone, From, Drive)]
+#[derive(Clone, From)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum LogicalPlan {
     Projection(Projection),
@@ -31,25 +29,22 @@ pub enum LogicalPlan {
     Limit(Limit),
 }
 
-#[derive(Clone, Drive, Builder)]
+#[derive(Clone, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"))]
 pub struct Limit {
-    #[drive(skip)]
     pub limit: Expr,
-    #[drive(skip)]
     pub offset: Option<Expr>,
-    pub input: Arc<LogicalPlan>,
+    pub input: Rc<LogicalPlan>,
 }
 
-#[derive(Clone, From, Drive, Builder)]
+#[derive(Clone, From, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"))]
 pub struct Sort {
-    #[drive(skip)]
     pub expr: Vec<OrderByExpr>,
     #[builder(setter(into))]
-    pub input: Arc<LogicalPlan>,
+    pub input: Rc<LogicalPlan>,
 }
 
 #[derive(Clone, Builder)]
@@ -77,9 +72,9 @@ impl fmt::Display for OrderByExpr {
     }
 }
 
-#[derive(Debug, Clone, Display, Drive, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Display, Hash, PartialEq, Eq)]
 #[display(fmt = "{_0}")]
-pub struct TableReference(#[drive(skip)] pub Arc<String>);
+pub struct TableReference(pub Rc<String>);
 
 impl Default for TableReference {
     fn default() -> Self {
@@ -96,88 +91,9 @@ impl Default for TableReference {
 )]
 pub struct Column {
     #[builder(setter(into))]
-    pub name: Arc<String>,
+    pub name: Rc<String>,
     #[builder(default)]
     pub relation: Option<TableReference>,
-}
-
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub struct ScalarValue(pub Option<pyo3::PyObject>);
-
-impl ScalarValue {
-    pub const NULL: Self = Self(None);
-
-    pub fn is_null(&self) -> bool {
-        self.0.is_none()
-    }
-
-    pub fn into_bound(self, py: Python<'_>) -> Bound<PyAny> {
-        if let Some(value) = self.0 {
-            value.into_bound(py).into_any()
-        } else {
-            PyNone::get_bound(py).into_py(py).into_bound(py)
-        }
-    }
-}
-//
-// impl PartialEq for ScalarValue {
-//     fn eq(&self, other: &Self) -> bool {
-//         Python::with_gil(|py| {
-//             if let (Some(a), Some(b)) = (self.0.as_ref(), other.0.as_ref()) {
-//                 a.bind(py).eq(b.bind(py)).unwrap_or(false)
-//             } else {
-//                 false
-//             }
-//         })
-//     }
-// }
-//
-// impl Eq for ScalarValue {}
-//
-// impl PartialOrd for ScalarValue {
-//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-//         Python::with_gil(|py| match (self.0.as_ref(), other.0.as_ref()) {
-//             (Some(a), Some(b)) => a.bind(py).compare(b.bind(py)).ok(),
-//             _ => todo!(),
-//         })
-//     }
-// }
-//
-// impl Ord for ScalarValue {
-//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-//         Python::with_gil(|py| match (self.0.as_ref(), other.0.as_ref()) {
-//             (Some(a), Some(b)) => a.bind(py).compare(b.bind(py)).unwrap(),
-//             _ => todo!(),
-//         })
-//     }
-// }
-
-impl From<PyObject> for ScalarValue {
-    fn from(value: PyObject) -> Self {
-        let value = Python::with_gil(|py| if value.is_none(py) { None } else { Some(value) });
-        Self(value)
-    }
-}
-
-impl IntoPy<PyObject> for ScalarValue {
-    fn into_py(self, py: Python<'_>) -> PyObject {
-        if let Some(value) = self.0 {
-            value.into_py(py)
-        } else {
-            PyNone::get_bound(py).into_py(py)
-        }
-    }
-}
-
-impl fmt::Display for ScalarValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(value) = &self.0 {
-            write!(f, "{value}")
-        } else {
-            write!(f, "None")
-        }
-    }
 }
 
 #[derive(Clone, Display, Builder)]
@@ -190,72 +106,64 @@ pub struct Alias {
     pub name: String,
 }
 
-#[derive(Clone, Builder, Drive)]
+#[derive(Clone, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct SubqueryAlias {
     pub alias: TableReference,
-    pub input: Arc<LogicalPlan>,
+    pub input: Rc<LogicalPlan>,
 }
 
-#[derive(Clone, Builder, Drive)]
+#[derive(Clone, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct Projection {
-    #[drive(skip)]
     pub expr: IndexMap<String, Expr>,
-    pub input: Arc<LogicalPlan>,
+    pub input: Rc<LogicalPlan>,
 }
 
-#[derive(Clone, Builder, Drive)]
+#[derive(Clone, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"))]
 pub struct EmptyRelation {
     #[builder(default = "true")]
-    #[drive(skip)]
     pub produce_one_row: bool,
 }
 
-#[derive(Clone, Builder, Drive)]
+#[derive(Clone, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"))]
 pub struct TableScan {
     pub table_name: TableReference,
-    #[drive(skip)]
     #[builder(default)]
     pub projection: Option<Vec<usize>>,
-    #[drive(skip)]
     #[builder(default)]
     pub filters: Vec<Expr>,
-    #[drive(skip)]
     #[builder(default)]
     pub fetch: Option<usize>,
 }
 
-#[derive(Clone, Builder, Drive)]
+#[derive(Clone, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct Filter {
-    #[drive(skip)]
     pub predicate: Expr,
-    pub input: Arc<LogicalPlan>,
+    pub input: Rc<LogicalPlan>,
 }
 
-#[derive(Clone, Builder, Drive)]
+#[derive(Clone, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct Join {
-    pub left: Arc<LogicalPlan>,
-    pub right: Arc<LogicalPlan>,
+    pub left: Rc<LogicalPlan>,
+    pub right: Rc<LogicalPlan>,
+    pub join_type: JoinType,
     /// equi conditions
-    #[drive(skip)]
+    #[builder(default)]
     pub on: Vec<(Expr, Expr)>,
     /// non-equi conditions
-    #[drive(skip)]
     #[builder(default)]
     pub filter: Option<Expr>,
-    #[drive(skip)]
-    pub join_type: JoinType,
 }
 
 #[derive(Clone, From, Display)]
@@ -263,7 +171,7 @@ pub struct Join {
 pub enum Expr {
     Column(Column),
     Alias(Alias),
-    Literal(ScalarValue),
+    Literal(Rc<PyObject>),
     UnaryExpr(UnaryExpr),
     BinaryExpr(BinaryExpr),
     ScalarFunction(ScalarFunction),
@@ -273,7 +181,7 @@ pub enum Expr {
 #[derive(Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct ScalarFunction {
-    pub func: Arc<dyn ScalarFunctionImpl>,
+    pub name: String,
     pub args: Vec<Expr>,
 }
 
@@ -282,15 +190,10 @@ impl fmt::Display for ScalarFunction {
         write!(
             f,
             "{}({})",
-            self.func.name(),
+            self.name,
             self.args.iter().map(|e| e.to_string()).join(", ")
         )
     }
-}
-
-pub trait ScalarFunctionImpl: std::fmt::Debug {
-    fn name(&self) -> &str;
-    fn invoke(&self, args: &[ScalarValue]) -> Result<ScalarValue, crate::executor::ExecError>;
 }
 
 #[derive(Clone, Display, Builder)]

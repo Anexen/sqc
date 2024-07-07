@@ -1,4 +1,7 @@
+use std::rc::Rc;
+
 use derive_more::{Display, Error, From};
+use optimizer::Optimizer;
 use pyo3::{
     create_exception,
     prelude::*,
@@ -6,12 +9,12 @@ use pyo3::{
 };
 
 mod executor;
-mod explain;
+mod functions;
 mod logical_plan;
+mod optimizer;
 mod parser;
 mod planner;
 mod stream;
-mod functions;
 
 pub use executor::{execute_plan, ExecutionContext};
 pub use parser::parse_query;
@@ -27,22 +30,34 @@ pub fn sqc(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(query, m)?)?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
-    m.add_function(wrap_pyfunction!(explain_, m)?)?;
     Ok(())
 }
 
 #[pyfunction]
+#[pyo3(signature = (query, data=None))]
 pub fn query(query: &str, data: Option<PyObject>) -> PyResult<PyObject> {
     let ast = parser::parse_query(query)?;
-    let plan = planner::prepare_plan(&ast)?;
-    // let plan = optimize_plan(plan);
+    let plan = Rc::new(planner::prepare_plan(&ast)?);
+    let plan = Optimizer::default().optimize(plan);
+
+    // Python::with_gil(|py| {
+    //     let locals = unsafe {
+    //         let ptr = pyo3::ffi::PyEval_GetLocals();
+    //         PyObject::from_borrowed_ptr(py, ptr)
+    //     };
+    //     println!("{:?}", locals.to_string());
+    // });
 
     Python::with_gil(|py| {
         let mut ctx = ExecutionContext::new();
         if let Some(data) = data {
             if let Ok(tables) = data.bind(py).downcast::<PyDict>() {
                 for (k, v) in tables {
-                    ctx.add_table(&k.to_string(), v.into());
+                    if v.is_callable() {
+                        ctx.add_scalar_udf(k.to_string(), v.unbind())
+                    } else {
+                        ctx.add_table(&k.to_string(), v.into());
+                    }
                 }
             } else {
                 ctx.add_table("data", data);
@@ -63,11 +78,6 @@ pub fn query(query: &str, data: Option<PyObject>) -> PyResult<PyObject> {
             })
             .collect::<Result<Vec<_>, _>>()
             .map(|x| x.into_py(py))
-            .map_err(PyErr::from)
-
-        // .map(|s| s.collect::<Result<Vec<_>, executor::ExecError>>())
-        // .map(|s| s.into_iter().map().into_py(py))
-        // Ok(pyo3::types::PyList::empty_bound(py).into_py(py))
     })
 }
 
@@ -77,13 +87,13 @@ pub fn parse(query: &str) -> PyResult<String> {
     Ok(format!("{ast:#?}"))
 }
 
-#[pyfunction(name = "explain")]
-pub fn explain_(query: &str) -> PyResult<String> {
-    let ast = parser::parse_query(query)?;
-    let plan = planner::prepare_plan(&ast)?;
-    let result = explain::explain(&plan);
-    Ok(result.to_string())
-}
+// #[pyfunction(name = "explain")]
+// pub fn explain_(query: &str) -> PyResult<String> {
+//     let ast = parser::parse_query(query)?;
+//     let plan = planner::prepare_plan(&ast)?;
+//     let result = explain::explain(&plan);
+//     Ok(result.to_string())
+// }
 
 #[derive(Debug, Display, Error, From)]
 pub enum SqcError {
@@ -105,12 +115,6 @@ impl From<parser::ParserError> for PyErr {
 
 impl From<logical_plan::PlanError> for PyErr {
     fn from(value: logical_plan::PlanError) -> Self {
-        PySqcError::new_err(value.to_string())
-    }
-}
-
-impl From<executor::ExecError> for PyErr {
-    fn from(value: executor::ExecError) -> Self {
         PySqcError::new_err(value.to_string())
     }
 }

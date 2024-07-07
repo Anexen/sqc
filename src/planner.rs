@@ -1,8 +1,12 @@
 use itertools::Itertools;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, rc::Rc};
 
 use indexmap::IndexMap;
-use pyo3::prelude::*;
+use pyo3::{
+    prelude::*,
+    types::{PyFloat, PyLong},
+    PyTypeInfo,
+};
 use sqlparser::ast;
 
 use crate::logical_plan::*;
@@ -278,17 +282,11 @@ impl Visitor {
                     .build()?
                     .into()
             }
-            ast::Expr::Function(function) => {
-                if function.name.to_string().to_lowercase() == "length" {
-                    ScalarFunction {
-                        func: Arc::new(crate::functions::scalar::Length),
-                        args: self.visit_function_arguments(&function.args)?,
-                    }
-                    .into()
-                } else {
-                    unimplemented!("{function}")
-                }
+            ast::Expr::Function(function) => ScalarFunction {
+                name: function.name.to_string(),
+                args: self.visit_function_arguments(&function.args)?,
             }
+            .into(),
             _ => unimplemented!("{expr:?}"),
         };
         Ok(result)
@@ -345,15 +343,23 @@ impl Visitor {
     }
 
     fn visit_value(&self, value: &ast::Value) -> PlanResult<Expr> {
-        let py_value = Python::with_gil(|py| match value {
-            ast::Value::Number(v, _) => Some(v.parse::<i64>().unwrap().into_py(py)),
-            ast::Value::SingleQuotedString(v) => Some(v.into_py(py)),
-            ast::Value::Boolean(v) => Some(v.into_py(py)),
-            ast::Value::Null => None,
+        let value: PyObject = Python::with_gil(|py| match value {
+            ast::Value::Number(v, _) => {
+                if v.contains('.') | v.contains('e') | v.contains('E') {
+                    PyFloat::type_object_bound(py).call1((v,)).unwrap().unbind()
+                } else {
+                    PyLong::type_object_bound(py).call1((v,)).unwrap().unbind()
+                }
+            }
+            ast::Value::SingleQuotedString(v) => v.into_py(py),
+            ast::Value::TripleSingleQuotedString(v) => v.into_py(py),
+            ast::Value::Boolean(v) => v.into_py(py),
+            ast::Value::Null => py.None(),
             // ast::Value::Placeholder(_) => unimplemented!(),
             _ => unimplemented!("{value}"),
         });
-        Ok(ScalarValue(py_value).into())
+
+        Ok(Expr::Literal(Rc::new(value)))
     }
 
     fn get_table_ref(&self, plan: &LogicalPlan) -> PlanResult<TableReference> {

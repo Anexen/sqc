@@ -107,10 +107,11 @@ impl Explain {
 
     fn enter_limit(&mut self, limit: &Limit) {
         self.push_indent();
-        self.content.push(format!(
-            "Limit: {}, Offset: {:?}\n",
-            limit.limit, limit.offset
-        ));
+        self.content.push(format!("Limit: {}", limit.limit));
+        if let Some(offset) = &limit.offset {
+            self.content.push(format!(", Offset: {offset}"));
+        }
+        self.content.push("\n".to_string());
         self.depth += 1;
     }
 

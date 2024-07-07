@@ -1,20 +1,19 @@
 use indexmap::IndexMap;
-use pyo3::PyObject;
+use pyo3::{PyErr, PyObject};
 
 use crate::logical_plan::TableReference;
 
-pub type RowData = IndexMap<String, PyObject>;
-pub type RowInner = IndexMap<TableReference, RowData>;
-pub type Row<E> = Result<RowInner, E>;
+pub type RowPart = IndexMap<String, PyObject>;
+pub type Row = IndexMap<TableReference, RowPart>;
 
-pub struct Stream<'s, E> {
-    inner: Box<dyn Iterator<Item = Row<E>> + 's>,
+pub struct Stream<'s, E = PyErr> {
+    inner: Box<dyn Iterator<Item = Result<Row, E>> + 's>,
 }
 
 impl<'s, E> Stream<'s, E> {
     pub fn new<I>(iter: I) -> Self
     where
-        I: IntoIterator<Item = Row<E>> + 's,
+        I: IntoIterator<Item = Result<Row, E>> + 's,
     {
         Stream {
             inner: Box::new(iter.into_iter()),
@@ -23,7 +22,7 @@ impl<'s, E> Stream<'s, E> {
 }
 
 impl<E> Iterator for Stream<'_, E> {
-    type Item = Row<E>;
+    type Item = Result<Row, E>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()

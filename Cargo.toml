@@ -19,11 +19,11 @@ derive_builder = "0.20"
 derive_more = { version = "0.99", default-features = false, features = ["display", "from", "error"] }
 indexmap = "2"
 itertools = "0.13"
-pyo3 = "0.21"
+pyo3 = { version = "0.22", features = ["indexmap"] }
 sqlparser = "0.47"
 
 [dev-dependencies]
-pyo3 = { version = "0.21", features = ["auto-initialize"] }
+pyo3 = { version = "0.22", features = ["auto-initialize"] }
 rstest = "0.21"
 # serde = { version = "1", features = ["derive"] }
 # serde-pyobject = "0.3.0"
