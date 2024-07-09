@@ -1,3 +1,4 @@
+use ambassador::Delegate;
 use derive_builder::{Builder, UninitializedFieldError};
 use derive_more::{Display, Error, From};
 use indexmap::IndexMap;
@@ -5,6 +6,8 @@ use itertools::Itertools;
 use pyo3::PyObject;
 use std::fmt;
 use std::rc::Rc;
+
+use crate::executor::{ambassador_impl_Exec, ambassador_impl_ExecExpr, Exec, ExecExpr};
 
 #[derive(Debug, Error, Display)]
 #[display(fmt = "{_0}")]
@@ -16,8 +19,9 @@ impl From<UninitializedFieldError> for PlanError {
     }
 }
 
-#[derive(Clone, From)]
+#[derive(Clone, From, Delegate)]
 #[cfg_attr(debug_assertions, derive(Debug))]
+#[delegate(Exec<'p>, generics = "'p")]
 pub enum LogicalPlan {
     Projection(Projection),
     TableScan(TableScan),
@@ -166,8 +170,9 @@ pub struct Join {
     pub filter: Option<Expr>,
 }
 
-#[derive(Clone, From, Display)]
+#[derive(Clone, From, Display, Delegate)]
 #[cfg_attr(debug_assertions, derive(Debug))]
+#[delegate(ExecExpr<'p>, generics = "'p")]
 pub enum Expr {
     Column(Column),
     Alias(Alias),
@@ -176,10 +181,92 @@ pub enum Expr {
     BinaryExpr(BinaryExpr),
     ScalarFunction(ScalarFunction),
     Wildcard(Wildcard),
+    Tuple(Tuple),
+    List(List),
+    Dict(Dict),
+    GetItem(GetItem),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
+#[builder(build_fn(error = "PlanError"))]
+pub struct Tuple {
+    pub elements: Vec<Expr>,
+}
+
+impl fmt::Display for Tuple {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "({})",
+            self.elements.iter().map(|e| e.to_string()).join(", ")
+        )
+    }
+}
+
+#[derive(Clone, Builder)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[builder(build_fn(error = "PlanError"))]
+pub struct List {
+    pub elements: Vec<Expr>,
+}
+
+impl fmt::Display for List {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}]",
+            self.elements.iter().map(|e| e.to_string()).join(", ")
+        )
+    }
+}
+
+#[derive(Clone, Builder)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[builder(build_fn(error = "PlanError"))]
+pub struct Dict {
+    pub items: Vec<(Expr, Expr)>,
+}
+
+impl fmt::Display for Dict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{{{}}}",
+            self.items
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .join(", ")
+        )
+    }
+}
+
+#[derive(Clone, Builder)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[builder(build_fn(error = "PlanError"))]
+pub struct GetItem {
+    #[builder(setter(into))]
+    pub input: Box<Expr>,
+    pub keys: Vec<Expr>,
+}
+
+impl fmt::Display for GetItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{}",
+            self.input,
+            self.keys
+                .iter()
+                .map(|e| format!("[{}]", e.to_string()))
+                .join("")
+        )
+    }
+}
+
+#[derive(Clone, Builder)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct ScalarFunction {
     pub name: String,
     pub args: Vec<Expr>,
@@ -294,14 +381,18 @@ pub enum Operator {
     Lt,
     #[display(fmt = "<=")]
     LtEq,
-    #[display(fmt = "AND")]
+    #[display(fmt = "and")]
     And,
-    #[display(fmt = "OR")]
+    #[display(fmt = "or")]
     Or,
-    #[display(fmt = "NOT")]
+    #[display(fmt = "not")]
     Not,
     #[display(fmt = "->")]
     Arrow,
+    #[display(fmt = "is")]
+    Is,
+    #[display(fmt = "is not")]
+    IsNot,
 }
 
 #[derive(Clone, Display)]
@@ -346,6 +437,19 @@ impl Expr {
             }
             Expr::ScalarFunction(f) => f.args.iter().for_each(|a| a.extract_columns_impl(columns)),
             Expr::Wildcard(_) => todo!(),
+            Expr::Tuple(Tuple { elements }) | Expr::List(List { elements }) => elements
+                .iter()
+                .for_each(|a| a.extract_columns_impl(columns)),
+            Expr::Dict(v) => {
+                v.items.iter().for_each(|(k, v)| {
+                    k.extract_columns_impl(columns);
+                    v.extract_columns_impl(columns);
+                });
+            }
+            Expr::GetItem(v) => {
+                v.input.extract_columns_impl(columns);
+                v.keys.iter().for_each(|k| k.extract_columns_impl(columns));
+            }
         };
     }
 

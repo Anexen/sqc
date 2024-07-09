@@ -1,9 +1,8 @@
-use std::rc::Rc;
-
 use derive_more::{Display, Error, From};
-use optimizer::Optimizer;
+// use optimizer::Optimizer;
 use pyo3::{
     create_exception,
+    exceptions::PyNameError,
     prelude::*,
     types::{IntoPyDict as _, PyDict},
 };
@@ -11,7 +10,7 @@ use pyo3::{
 mod executor;
 mod functions;
 mod logical_plan;
-mod optimizer;
+// mod optimizer;
 mod parser;
 mod planner;
 mod stream;
@@ -35,50 +34,46 @@ pub fn sqc(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[pyfunction]
 #[pyo3(signature = (query, data=None))]
-pub fn query(query: &str, data: Option<PyObject>) -> PyResult<PyObject> {
+pub fn query(py: Python<'_>, query: &str, data: Option<PyObject>) -> PyResult<PyObject> {
     let ast = parser::parse_query(query)?;
-    let plan = Rc::new(planner::prepare_plan(&ast)?);
-    let plan = Optimizer::default().optimize(plan);
+    let plan = planner::prepare_plan(&ast)?;
 
-    // Python::with_gil(|py| {
-    //     let locals = unsafe {
-    //         let ptr = pyo3::ffi::PyEval_GetLocals();
-    //         PyObject::from_borrowed_ptr(py, ptr)
-    //     };
-    //     println!("{:?}", locals.to_string());
-    // });
+    // let plan = Optimizer::default().optimize(plan.logical_plan);
 
-    Python::with_gil(|py| {
-        let mut ctx = ExecutionContext::new();
-        if let Some(data) = data {
-            if let Ok(tables) = data.bind(py).downcast::<PyDict>() {
-                for (k, v) in tables {
-                    if v.is_callable() {
-                        ctx.add_scalar_udf(k.to_string(), v.unbind())
-                    } else {
-                        ctx.add_table(&k.to_string(), v.into());
-                    }
+    let mut ctx = ExecutionContext::new();
+
+    if !plan.external_names.is_empty() {
+        try_extract_variables_from_scope(py, &plan.external_names, &mut ctx).ok();
+    }
+
+    if let Some(data) = data {
+        if let Ok(tables) = data.bind(py).downcast::<PyDict>() {
+            for (k, v) in tables {
+                if v.is_callable() {
+                    ctx.add_scalar_udf(&k.to_string(), v.unbind())
+                } else {
+                    ctx.add_table(&k.to_string(), v.into());
                 }
-            } else {
-                ctx.add_table("data", data);
-            };
-        }
+            }
+        } else {
+            ctx.add_table("data", data);
+        };
+    }
 
-        let stream = execute_plan(py, &plan, &mut ctx).map_err(PyErr::from)?;
+    let stream = execute_plan(py, &plan.logical_plan, &mut ctx)?;
 
-        stream
-            .map(|row| {
-                row.map(|p| {
-                    p.into_values()
-                        .flat_map(|v| v.into_iter())
-                        .collect::<Vec<_>>()
-                        .into_py_dict_bound(py)
-                        .unbind()
-                })
+    stream
+        .map(|row| {
+            row.map(|p| {
+                p.into_values()
+                    .flat_map(|v| v.into_iter())
+                    .collect::<Vec<_>>()
+                    .into_py_dict_bound(py)
+                    .unbind()
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|x| x.into_py(py))
-    })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|x| x.into_py(py))
 }
 
 #[pyfunction]
@@ -98,7 +93,7 @@ pub fn parse(query: &str) -> PyResult<String> {
 #[derive(Debug, Display, Error, From)]
 pub enum SqcError {
     #[display(fmt = "query parsing error")]
-    ParserError(parser::ParserError),
+    ParserError(parser::QueryParserError),
     #[display(fmt = "query planning error")]
     PlannerError(logical_plan::PlanError),
     #[display(fmt = "table not found: {_0}")]
@@ -107,8 +102,8 @@ pub enum SqcError {
     RuntimeError(PyErr),
 }
 
-impl From<parser::ParserError> for PyErr {
-    fn from(value: parser::ParserError) -> Self {
+impl From<parser::QueryParserError> for PyErr {
+    fn from(value: parser::QueryParserError) -> Self {
         PyParserError::new_err(value.to_string())
     }
 }
@@ -123,4 +118,41 @@ impl From<SqcError> for PyErr {
     fn from(value: SqcError) -> Self {
         PySqcError::new_err(value.to_string())
     }
+}
+
+fn try_extract_variables_from_scope(
+    py: Python<'_>,
+    variables: &[String],
+    ctx: &mut ExecutionContext,
+) -> PyResult<()> {
+    let locals =
+        unsafe { Py::<PyDict>::from_borrowed_ptr_or_err(py, pyo3::ffi::PyEval_GetLocals()) }?;
+
+    let globals =
+        unsafe { Py::<PyDict>::from_borrowed_ptr_or_err(py, pyo3::ffi::PyEval_GetGlobals()) }?;
+
+    let locals = locals.bind(py);
+    let globals = globals.bind(py);
+
+    for name in variables {
+        let _name = &name[1..];
+        let value = if let Ok(Some(value)) = locals.get_item(_name) {
+            value
+        } else if let Ok(Some(value)) = globals.get_item(_name) {
+            value
+        } else {
+            return Err(PyNameError::new_err(format!(
+                "variable `{}` is not defined",
+                _name
+            )));
+        };
+
+        if value.is_callable() {
+            ctx.add_scalar_udf(name, value.unbind())
+        } else {
+            ctx.add_table(name, value.unbind());
+        }
+    }
+
+    Ok(())
 }

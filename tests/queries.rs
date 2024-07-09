@@ -11,15 +11,17 @@ fn test_select_const() {
     let query = r#"
     SELECT
         'one' AS string_literal,
-        'a' + 'b' + 'c' AS "ABC",
+        'a' + 'b' + 'c' AS `ABC`,
         2 * 10 < 3 * 7 AS boolean_result,
         NOT 10 < 4 * 5 / 2 + 1 AS inversion,
         (2 + 2 * 2) % 2 = 0 AS is_even,
         123456 * 1000 // 33 AS intdiv,
         3 + 4/(2*3*4) - 4/(4*5*6) + 4/(6*7*8) - 4/(8*9*10) + 4/(10*11*12) AS `PI`,
+        2 ** (1 + 2) as power,
+        None as nnn,
     "#;
 
-    let result = sqc::query(query, None).unwrap();
+    let result = query!(query).unwrap();
 
     let expected = py!([{
         "string_literal": "one",
@@ -29,6 +31,37 @@ fn test_select_const() {
         "is_even": True,
         "intdiv": 3741090,
         "PI": 3. + 4./24. - 4./120. + 4./336. - 4./720. + 4./1320.,
+        "power": 8,
+        "nnn": None,
+    }]);
+
+    py_assert_eq!(result, expected);
+}
+
+#[rstest]
+fn test_is_operator() {
+    let query = r#"
+    SELECT
+        None is None as is_none,
+        1 is None as one_is_none,
+        None is not 1 as none_is_not_1,
+        1 < 2 is True as is_true,
+        @a is @b and @b is not @c and @c is @c and @c is not 257 and @a is not None AS int_trick,
+    "#;
+
+    // CPython trick: when creating an int value in the range of -5 to 256, a reference to an
+    // existing object is returned. However, values outside this range are created as separate
+    // objects. So, any integer > 256 will have different id
+    let a = py!(257);
+    let ctx = py!({"@a": &a, "@b": &a, "@c": 257});
+    let result = query!(query, ctx).unwrap();
+
+    let expected = py!([{
+        "is_none": True,
+        "one_is_none": False,
+        "none_is_not_1": True,
+        "is_true": True,
+        "int_trick": True,
     }]);
 
     py_assert_eq!(result, expected);
@@ -43,7 +76,7 @@ fn test_select_wildcard(repositories: &PyObject) {
     "#;
 
     let tables = py!({"repositories": repositories});
-    let result = sqc::query(query, Some(tables.into())).unwrap();
+    let result = query!(query, tables).unwrap();
     let expected = py!([
         {"id": 51480, "name": "tpope/vim-surround", "url": "https://api.github.com/repos/tpope/vim-surround"}
     ]);
@@ -58,7 +91,7 @@ fn test_table_alias() {
     "#;
 
     let data = py!([{"a": 1, "b": 2, "c": False}]);
-    let result = sqc::query(query, Some(data.into())).unwrap();
+    let result = query!(query, data).unwrap();
     let expected = py!([{"a": 1, "b": False }]);
     py_assert_eq!(result, expected);
 }
@@ -76,7 +109,7 @@ fn test_select_nested() {
         {"p": "b", "v": {"x": {"b": {"by": [{"key": 2}, {"value": 22}]}}}},
         {"p": "c", "v": {"x": {"c": {"cy": [{"key": 3}, {"value": 33}]}}}},
     ]);
-    let result = sqc::query(query, Some(data.into())).unwrap();
+    let result = query!(query, data).unwrap();
     let expected = py!([{"k": 3}]);
     py_assert_eq!(result, expected);
 }
@@ -106,7 +139,7 @@ fn test_join_multi(events: &PyObject, users: &PyObject, pull_requests: &PyObject
         "pull_requests": pull_requests
     });
 
-    let result = sqc::query(query, Some(tables.into())).unwrap();
+    let result = query!(query, tables).unwrap();
     let expected = py!([
         {"id": 26744152, "title": "Merge v2 to trunk", "login": "danarmak" },
         {"id": 26743810, "title": "Pulling version 1.9.2", "login": "lunarok" },
@@ -125,8 +158,8 @@ fn test_order_by(issues: &PyObject) {
     "#;
 
     let tables = py!({"issues": issues});
+    let result = query!(query, tables).unwrap();
 
-    let result = sqc::query(query, Some(tables.into())).unwrap();
     let expected = py!([
         {"id": 40068791, "title": "Moderator page"},
         {"id": 12787733, "title": "Moderator tab"},
@@ -146,7 +179,7 @@ fn test_function_call(users: &PyObject) {
     "#;
 
     let tables = py!({"users": users});
-    let result = sqc::query(query, Some(tables.into())).unwrap();
+    let result = query!(query, tables).unwrap();
     let expected = py!([
         {"id": 121686, "login": "JohnathonReasons"},
         {"id": 368838, "login": "fredrik-johansson"},

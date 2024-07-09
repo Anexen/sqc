@@ -6,6 +6,7 @@ mod iterable;
 mod strings;
 mod type_conversion;
 mod udf;
+mod math;
 
 pub use udf::ScalarUDF;
 
@@ -29,6 +30,7 @@ pub fn registry() -> Vec<Rc<dyn ScalarFunctionImpl>> {
         Rc::new(type_conversion::ToString),
         Rc::new(type_conversion::ToInt),
         Rc::new(iterable::Length),
+        Rc::new(math::Power),
         Rc::new(strings::Lowercase),
         Rc::new(strings::Uppercase),
         Rc::new(strings::Repeat),

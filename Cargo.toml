@@ -14,13 +14,13 @@ name = "sqc"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-derive-visitor = "0.4"
+ambassador = "0.4"
 derive_builder = "0.20"
 derive_more = { version = "0.99", default-features = false, features = ["display", "from", "error"] }
 indexmap = "2"
 itertools = "0.13"
 pyo3 = { version = "0.22", features = ["indexmap"] }
-sqlparser = "0.47"
+sqlparser = "0.48"
 
 [dev-dependencies]
 pyo3 = { version = "0.22", features = ["auto-initialize"] }

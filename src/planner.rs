@@ -14,14 +14,28 @@ use crate::logical_plan::*;
 type PlanResult<T = LogicalPlan> = Result<T, PlanError>;
 type EquijoinPredicate = (Expr, Expr);
 
-pub fn prepare_plan(query: &ast::Query) -> PlanResult {
-    Visitor.visit_query(query)
+pub fn prepare_plan(query: &ast::Query) -> Result<PreparedPlan, PlanError> {
+    let mut visitor = Visitor::default();
+    let result = visitor.visit_query(query)?;
+
+    Ok(PreparedPlan {
+        logical_plan: Rc::new(result),
+        external_names: visitor.external_names,
+    })
 }
 
-struct Visitor;
+pub struct PreparedPlan {
+    pub logical_plan: Rc<LogicalPlan>,
+    pub external_names: Vec<String>,
+}
+
+#[derive(Default)]
+struct Visitor {
+    external_names: Vec<String>,
+}
 
 impl Visitor {
-    fn visit_query(&self, query: &ast::Query) -> PlanResult {
+    pub fn visit_query(&mut self, query: &ast::Query) -> PlanResult {
         let mut result = self.visit_set_expr(query.body.as_ref(), query.order_by.as_ref())?;
 
         if let Some(limit) = query.limit.as_ref() {
@@ -42,7 +56,7 @@ impl Visitor {
         Ok(result)
     }
 
-    fn visit_set_expr(&self, expr: &ast::SetExpr, order_by: &[ast::OrderByExpr]) -> PlanResult {
+    fn visit_set_expr(&mut self, expr: &ast::SetExpr, order_by: &[ast::OrderByExpr]) -> PlanResult {
         match expr {
             ast::SetExpr::Select(select) => self.visit_select(select, order_by),
             ast::SetExpr::Query(query) => self.visit_query(query),
@@ -50,7 +64,7 @@ impl Visitor {
         }
     }
 
-    fn visit_select(&self, select: &ast::Select, order_by: &[ast::OrderByExpr]) -> PlanResult {
+    fn visit_select(&mut self, select: &ast::Select, order_by: &[ast::OrderByExpr]) -> PlanResult {
         let mut result = self.visit_from(&select.from)?;
         if let Some(predicate) = &select.selection {
             result = FilterBuilder::default()
@@ -83,7 +97,7 @@ impl Visitor {
         Ok(result)
     }
 
-    fn visit_from(&self, from: &[ast::TableWithJoins]) -> PlanResult {
+    fn visit_from(&mut self, from: &[ast::TableWithJoins]) -> PlanResult {
         if from.is_empty() {
             return Ok(EmptyRelationBuilder::default().build()?.into());
         };
@@ -100,7 +114,7 @@ impl Visitor {
         Ok(scans.into_iter().next().unwrap())
     }
 
-    fn visit_table_with_joins(&self, table: &ast::TableWithJoins) -> PlanResult {
+    fn visit_table_with_joins(&mut self, table: &ast::TableWithJoins) -> PlanResult {
         let mut result = self.visit_table_factor(&table.relation)?;
 
         if table.joins.is_empty() {
@@ -119,7 +133,7 @@ impl Visitor {
         Ok(result)
     }
 
-    fn visit_order_by_expr(&self, order_by: &ast::OrderByExpr) -> PlanResult<OrderByExpr> {
+    fn visit_order_by_expr(&mut self, order_by: &ast::OrderByExpr) -> PlanResult<OrderByExpr> {
         let expr = self.visit_expr(&order_by.expr)?;
 
         // null values sort as if larger than any non-null value, so
@@ -135,7 +149,7 @@ impl Visitor {
     }
 
     fn visit_join(
-        &self,
+        &mut self,
         left: &LogicalPlan,
         join: &ast::Join,
         left_refs: &[TableReference],
@@ -170,7 +184,7 @@ impl Visitor {
     }
 
     fn visit_join_constraint(
-        &self,
+        &mut self,
         join_constraint: &ast::JoinConstraint,
         left_refs: &[TableReference],
         right_refs: &[TableReference],
@@ -184,11 +198,16 @@ impl Visitor {
         }
     }
 
-    fn visit_table_factor(&self, table_factor: &ast::TableFactor) -> PlanResult {
+    fn visit_table_factor(&mut self, table_factor: &ast::TableFactor) -> PlanResult {
         match table_factor {
             ast::TableFactor::Table { name, alias, .. } => {
+                let name = name.to_string();
+                if name.starts_with('@') {
+                    self.external_names.push(name.clone());
+                }
+
                 let mut result = TableScanBuilder::default()
-                    .table_name(TableReference(name.to_string().into()))
+                    .table_name(TableReference(name.into()))
                     .build()?
                     .into();
 
@@ -207,7 +226,7 @@ impl Visitor {
     }
 
     fn visit_projection(
-        &self,
+        &mut self,
         projection: &[ast::SelectItem],
     ) -> PlanResult<IndexMap<String, Expr>> {
         projection
@@ -236,12 +255,18 @@ impl Visitor {
             .collect()
     }
 
-    fn visit_expr(&self, expr: &ast::Expr) -> PlanResult<Expr> {
+    fn visit_expr(&mut self, expr: &ast::Expr) -> PlanResult<Expr> {
         let result = match expr {
-            ast::Expr::Identifier(ident) => ColumnBuilder::default()
-                .name(ident.value.clone())
-                .build()?
-                .into(),
+            ast::Expr::Identifier(ident) => {
+                if ident.value.starts_with('@') {
+                    self.external_names.push(ident.value.clone())
+                }
+
+                ColumnBuilder::default()
+                    .name(ident.value.clone())
+                    .build()?
+                    .into()
+            }
             ast::Expr::CompoundIdentifier(ident) => ColumnBuilder::default()
                 .name(ident[ident.len() - 1].value.clone())
                 .relation(if !ident.is_empty() {
@@ -282,17 +307,70 @@ impl Visitor {
                     .build()?
                     .into()
             }
-            ast::Expr::Function(function) => ScalarFunction {
-                name: function.name.to_string(),
-                args: self.visit_function_arguments(&function.args)?,
+            ast::Expr::Function(function) => {
+                let name = function.name.to_string();
+                if name.starts_with('@') {
+                    self.external_names.push(name.clone())
+                }
+
+                ScalarFunctionBuilder::default()
+                    .name(name)
+                    .args(self.visit_function_arguments(&function.args)?)
+                    .build()?
+                    .into()
             }
-            .into(),
+            ast::Expr::IsDistinctFrom(left, right) => BinaryExprBuilder::default()
+                .left(self.visit_expr(left)?)
+                .op(Operator::IsNot)
+                .right(self.visit_expr(right)?)
+                .build()?
+                .into(),
+            ast::Expr::IsNotDistinctFrom(left, right) => BinaryExprBuilder::default()
+                .left(self.visit_expr(left)?)
+                .op(Operator::Is)
+                .right(self.visit_expr(right)?)
+                .build()?
+                .into(),
+            ast::Expr::Tuple(elements) => TupleBuilder::default()
+                .elements(elements.iter().map(|x| self.visit_expr(x)).try_collect()?)
+                .build()?
+                .into(),
+            ast::Expr::Array(array) => ListBuilder::default()
+                .elements(
+                    array
+                        .elem
+                        .iter()
+                        .map(|x| self.visit_expr(x))
+                        .try_collect()?,
+                )
+                .build()?
+                .into(),
+            ast::Expr::Dictionary(items) => DictBuilder::default()
+                .items(
+                    items
+                        .iter()
+                        .map(|x| -> PlanResult<_> {
+                            let key = Python::with_gil(|py| {
+                                Expr::Literal(Rc::new(x.key.value.clone().into_py(py)))
+                            });
+                            let value = self.visit_expr(&x.value)?;
+                            Ok((key, value))
+                        })
+                        .try_collect()?,
+                )
+                .build()?
+                .into(),
+            ast::Expr::MapAccess { column, keys } => GetItemBuilder::default()
+                .input(self.visit_expr(column)?)
+                .keys(keys.iter().map(|k| self.visit_expr(&k.key)).try_collect()?)
+                .build()?
+                .into(),
             _ => unimplemented!("{expr:?}"),
         };
         Ok(result)
     }
 
-    fn visit_function_arguments(&self, args: &ast::FunctionArguments) -> PlanResult<Vec<Expr>> {
+    fn visit_function_arguments(&mut self, args: &ast::FunctionArguments) -> PlanResult<Vec<Expr>> {
         match args {
             ast::FunctionArguments::None => Ok(vec![]),
             ast::FunctionArguments::Subquery(_) => todo!(),
@@ -311,7 +389,7 @@ impl Visitor {
         }
     }
 
-    fn visit_unary_op(&self, op: &ast::UnaryOperator) -> PlanResult<Operator> {
+    fn visit_unary_op(&mut self, op: &ast::UnaryOperator) -> PlanResult<Operator> {
         use ast::UnaryOperator::*;
         Ok(match op {
             Plus => Operator::Plus,
@@ -321,7 +399,7 @@ impl Visitor {
         })
     }
 
-    fn visit_binary_op(&self, op: &ast::BinaryOperator) -> PlanResult<Operator> {
+    fn visit_binary_op(&mut self, op: &ast::BinaryOperator) -> PlanResult<Operator> {
         use ast::BinaryOperator::*;
         Ok(match op {
             Plus => Operator::Plus,
@@ -342,7 +420,7 @@ impl Visitor {
         })
     }
 
-    fn visit_value(&self, value: &ast::Value) -> PlanResult<Expr> {
+    fn visit_value(&mut self, value: &ast::Value) -> PlanResult<Expr> {
         let value: PyObject = Python::with_gil(|py| match value {
             ast::Value::Number(v, _) => {
                 if v.contains('.') | v.contains('e') | v.contains('E') {
@@ -352,7 +430,9 @@ impl Visitor {
                 }
             }
             ast::Value::SingleQuotedString(v) => v.into_py(py),
+            ast::Value::DoubleQuotedString(v) => v.into_py(py),
             ast::Value::TripleSingleQuotedString(v) => v.into_py(py),
+            ast::Value::TripleDoubleQuotedString(v) => v.into_py(py),
             ast::Value::Boolean(v) => v.into_py(py),
             ast::Value::Null => py.None(),
             // ast::Value::Placeholder(_) => unimplemented!(),
@@ -362,7 +442,7 @@ impl Visitor {
         Ok(Expr::Literal(Rc::new(value)))
     }
 
-    fn get_table_ref(&self, plan: &LogicalPlan) -> PlanResult<TableReference> {
+    fn get_table_ref(&mut self, plan: &LogicalPlan) -> PlanResult<TableReference> {
         let table_ref = match plan {
             LogicalPlan::TableScan(v) => v.table_name.clone(),
             LogicalPlan::SubqueryAlias(v) => v.alias.clone(),
@@ -377,7 +457,7 @@ impl Visitor {
     }
 
     fn split_eq_and_noneq_join_predicate(
-        &self,
+        &mut self,
         filter: &Expr,
         left_refs: &[TableReference],
         right_refs: &[TableReference],
@@ -413,7 +493,7 @@ impl Visitor {
     }
 
     fn find_valid_equijoin_key_pair(
-        &self,
+        &mut self,
         left: &Expr,
         right: &Expr,
         left_refs: &[TableReference],
@@ -432,7 +512,7 @@ impl Visitor {
         }
     }
 
-    fn check_all_columns_from_relation(&self, expr: &Expr, tables: &[TableReference]) -> bool {
+    fn check_all_columns_from_relation(&mut self, expr: &Expr, tables: &[TableReference]) -> bool {
         let columns = expr.extract_columns();
         columns
             .iter()

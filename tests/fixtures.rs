@@ -1,6 +1,22 @@
 use pyo3::prelude::*;
 use rstest::*;
 
+
+#[macro_export]
+macro_rules! query {
+    ($query:expr) => {
+        ::pyo3::Python::with_gil(|py| {
+            ::sqc::query(py, $query, None)
+        })
+    };
+    ($query:expr, $ctx:expr) => {
+        ::pyo3::Python::with_gil(|py| {
+            ::sqc::query(py, $query, Some($ctx.into()))
+        })
+    };
+}
+
+
 #[fixture]
 #[once]
 pub fn users() -> PyObject {

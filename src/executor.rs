@@ -3,6 +3,7 @@ use std::{
     rc::Rc,
 };
 
+use ambassador::delegatable_trait;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use pyo3::{exceptions::PyNameError, prelude::*, types::*};
@@ -36,9 +37,9 @@ impl ExecutionContext {
         Self::default()
     }
 
-    pub fn add_scalar_udf(&mut self, name: String, function: PyObject) {
+    pub fn add_scalar_udf(&mut self, name: &str, function: PyObject) {
         self.scalar_functions
-            .insert(name, Rc::new(ScalarUDF::new(function)));
+            .insert(name.to_string(), Rc::new(ScalarUDF::new(function)));
     }
 
     pub fn add_table(&mut self, name: &str, data: PyObject) {
@@ -77,32 +78,23 @@ pub fn execute_plan<'p>(
     plan.execute(py, ctx)
 }
 
-trait Exec<'p> {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> PyResult<Stream<'p>>;
-}
-
-trait ExecScalar<'p> {
+#[delegatable_trait]
+pub trait Exec<'p> {
     fn execute(
         &'p self,
-        py: Python<'p>,
-        ctx: &'p ExecutionContext,
-        row: &'p Row,
-    ) -> PyResult<PyObject>;
+        py: ::pyo3::Python<'p>,
+        ctx: &'p crate::executor::ExecutionContext,
+    ) -> ::pyo3::PyResult<crate::stream::Stream<'p>>;
 }
 
-impl<'p> Exec<'p> for LogicalPlan {
-    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> PyResult<Stream<'p>> {
-        match self {
-            LogicalPlan::Projection(v) => v.execute(py, ctx),
-            LogicalPlan::TableScan(v) => v.execute(py, ctx),
-            LogicalPlan::Filter(v) => v.execute(py, ctx),
-            LogicalPlan::EmptyRelation(v) => v.execute(py, ctx),
-            LogicalPlan::SubqueryAlias(v) => v.execute(py, ctx),
-            LogicalPlan::Join(v) => v.execute(py, ctx),
-            LogicalPlan::Sort(v) => v.execute(py, ctx),
-            LogicalPlan::Limit(v) => v.execute(py, ctx),
-        }
-    }
+#[delegatable_trait]
+pub trait ExecExpr<'p> {
+    fn execute(
+        &'p self,
+        py: ::pyo3::Python<'p>,
+        ctx: &'p crate::executor::ExecutionContext,
+        row: &'p crate::stream::Row,
+    ) -> pyo3::PyResult<pyo3::PyObject>;
 }
 
 impl<'p> Exec<'p> for Projection {
@@ -322,118 +314,253 @@ fn evaluate_predicate(
         .and_then(|x| x.is_truthy(py))
 }
 
-impl<'p> ExecScalar<'p> for Expr {
+impl<'p> ExecExpr<'p> for Wildcard {
+    fn execute(
+        &'p self,
+        _py: Python<'p>,
+        _ctx: &'p ExecutionContext,
+        _row: &'p Row,
+    ) -> PyResult<PyObject> {
+        unreachable!();
+    }
+}
+
+impl<'p> ExecExpr<'p> for Alias {
+    fn execute(
+        &'p self,
+        _py: Python<'p>,
+        _ctx: &'p ExecutionContext,
+        _row: &'p Row,
+    ) -> PyResult<PyObject> {
+        unreachable!();
+    }
+}
+impl<'p> ExecExpr<'p> for Column {
     fn execute(
         &'p self,
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
     ) -> PyResult<PyObject> {
-        match self {
-            Expr::Column(column) => {
-                let table_ref = match column.relation.as_ref() {
-                    Some(t) => t,
-                    None => {
-                        let candidates = row
-                            .iter()
-                            .filter_map(|(k, v)| v.contains_key(column.name.as_ref()).then_some(k))
-                            .take(2)
-                            .collect_vec();
-
-                        match candidates.len() {
-                            0 => {
-                                return Err(PyNameError::new_err(format!(
-                                    "column `{}` is not defined",
-                                    column.name
-                                )))
-                            }
-                            1 => candidates[0],
-                            _ => {
-                                return Err(PyNameError::new_err(format!(
-                                    "column `{}` is ambiguous",
-                                    column.name
-                                )))
-                            }
-                        }
-                    }
-                };
-                let part = row.get(table_ref).ok_or_else(|| {
-                    PyNameError::new_err(format!("table `{}` is not defined", table_ref))
-                })?;
-
-                let result = match part.get(column.name.as_ref()) {
-                    Some(x) => x.into_py(py),
-                    None => return Ok(py.None()),
-                };
-
-                Ok(result.into())
-            }
-            Expr::Literal(scalar) => Ok(scalar.clone_ref(py)),
-            Expr::UnaryExpr(unary_expr) => {
-                let value = unary_expr.expr.execute(py, ctx, row)?;
-
-                if value.is_none(py) {
-                    return Ok(value);
-                }
-
-                let result = match unary_expr.op {
-                    Operator::Plus => value.call_method0(py, "__pos__")?,
-                    Operator::Minus => value.call_method0(py, "__neg__")?,
-                    Operator::Not => (!value.is_truthy(py)?).into_py(py),
-                    _ => unreachable!(),
-                };
-
-                Ok(result.into())
-            }
-            Expr::BinaryExpr(binary_expr) => {
-                let left = binary_expr.left.execute(py, ctx, row)?;
-                let right = binary_expr.right.execute(py, ctx, row)?;
-
-                if left.is_none(py) | right.is_none(py) {
-                    return Ok(py.None());
-                };
-                let left = left.bind(py);
-                let right = right.bind(py);
-
-                let result = match binary_expr.op {
-                    Operator::Plus => left.add(right)?.into_py(py),
-                    Operator::Minus => left.sub(right)?.into_py(py),
-                    Operator::Multiply => left.mul(right)?.into_py(py),
-                    Operator::Divide => left.div(right)?.into_py(py),
-                    Operator::IntegerDivide => {
-                        left.call_method1("__floordiv__", (right,))?.into_py(py)
-                    }
-                    Operator::Modulo => left.call_method1("__mod__", (right,))?.into_py(py),
-                    Operator::Eq => left.eq(right)?.into_py(py),
-                    Operator::Gt => left.gt(right)?.into_py(py),
-                    Operator::GtEq => left.ge(right)?.into_py(py),
-                    Operator::Lt => left.lt(right)?.into_py(py),
-                    Operator::LtEq => left.le(right)?.into_py(py),
-                    Operator::And => (left.is_truthy()? && right.is_truthy()?).into_py(py),
-                    Operator::Or => (left.is_truthy()? || right.is_truthy()?).into_py(py),
-                    Operator::Not => unreachable!(),
-                    Operator::Arrow => match left.get_item(right) {
-                        Ok(x) => x.into_py(py),
-                        Err(_) => return Ok(py.None()),
-                    },
-                };
-
-                Ok(result.into())
-            }
-            Expr::ScalarFunction(f) => {
-                let args: Vec<_> = f
-                    .args
-                    .iter()
-                    .map(|expr| expr.execute(py, ctx, row))
-                    .try_collect()?;
-
-                let f_impl = ctx.scalar_functions.get(&f.name).ok_or_else(|| {
-                    PyNameError::new_err(format!("function `{}` is not defined", f.name))
-                })?;
-
-                f_impl.invoke(py, &args)
-            }
-            _ => todo!(),
+        if self.name.starts_with('@') {
+            return ctx
+                .tables
+                .get(self.name.as_ref())
+                .map(|v| v.clone_ref(py))
+                .ok_or_else(|| {
+                    PyNameError::new_err(format!("variable `{}` is not defined", self.name))
+                });
         }
+
+        let table_ref = match self.relation.as_ref() {
+            Some(t) => t,
+            None => {
+                let candidates = row
+                    .iter()
+                    .filter_map(|(k, v)| v.contains_key(self.name.as_ref()).then_some(k))
+                    .take(2)
+                    .collect_vec();
+
+                match candidates.len() {
+                    0 => {
+                        return Err(PyNameError::new_err(format!(
+                            "column `{}` is not defined",
+                            self.name
+                        )))
+                    }
+                    1 => candidates[0],
+                    _ => {
+                        return Err(PyNameError::new_err(format!(
+                            "column `{}` is ambiguous",
+                            self.name
+                        )))
+                    }
+                }
+            }
+        };
+        let part = row
+            .get(table_ref)
+            .ok_or_else(|| PyNameError::new_err(format!("table `{}` is not defined", table_ref)))?;
+
+        let result = match part.get(self.name.as_ref()) {
+            Some(x) => x.into_py(py),
+            None => return Ok(py.None()),
+        };
+
+        Ok(result.into())
+    }
+}
+
+impl<'p> ExecExpr<'p> for Rc<PyObject> {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        _ctx: &'p ExecutionContext,
+        _row: &'p Row,
+    ) -> PyResult<PyObject> {
+        Ok(self.clone_ref(py))
+    }
+}
+
+impl<'p> ExecExpr<'p> for UnaryExpr {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<PyObject> {
+        let value = self.expr.execute(py, ctx, row)?;
+
+        if value.is_none(py) {
+            return Ok(value);
+        }
+
+        let result = match self.op {
+            Operator::Plus => value.call_method0(py, "__pos__")?,
+            Operator::Minus => value.call_method0(py, "__neg__")?,
+            Operator::Not => (!value.is_truthy(py)?).into_py(py),
+            _ => unreachable!(),
+        };
+
+        Ok(result.into())
+    }
+}
+impl<'p> ExecExpr<'p> for BinaryExpr {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<PyObject> {
+        let left = self.left.execute(py, ctx, row)?;
+        let right = self.right.execute(py, ctx, row)?;
+
+        if !matches!(self.op, Operator::Is | Operator::IsNot)
+            && (left.is_none(py) | right.is_none(py))
+        {
+            return Ok(py.None());
+        };
+
+        let left = left.bind(py);
+        let right = right.bind(py);
+
+        let result = match self.op {
+            Operator::Plus => left.add(right)?.into_py(py),
+            Operator::Minus => left.sub(right)?.into_py(py),
+            Operator::Multiply => left.mul(right)?.into_py(py),
+            Operator::Divide => left.div(right)?.into_py(py),
+            Operator::IntegerDivide => left.call_method1("__floordiv__", (right,))?.into_py(py),
+            Operator::Modulo => left.call_method1("__mod__", (right,))?.into_py(py),
+            Operator::Eq => left.eq(right)?.into_py(py),
+            Operator::Gt => left.gt(right)?.into_py(py),
+            Operator::GtEq => left.ge(right)?.into_py(py),
+            Operator::Lt => left.lt(right)?.into_py(py),
+            Operator::LtEq => left.le(right)?.into_py(py),
+            Operator::And => (left.is_truthy()? && right.is_truthy()?).into_py(py),
+            Operator::Or => (left.is_truthy()? || right.is_truthy()?).into_py(py),
+            Operator::Not => unreachable!(),
+            // Operator::Arrow => match left.get_item(right) {
+            //     Ok(x) => x.into_py(py),
+            //     Err(_) => return Ok(py.None()),
+            // },
+            Operator::Arrow => todo!(),
+            Operator::Is => left.is(right).into_py(py),
+            Operator::IsNot => (!left.is(right)).into_py(py),
+        };
+
+        Ok(result.into())
+    }
+}
+
+impl<'p> ExecExpr<'p> for ScalarFunction {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<PyObject> {
+        let args: Vec<_> = self
+            .args
+            .iter()
+            .map(|expr| expr.execute(py, ctx, row))
+            .try_collect()?;
+
+        let f_impl = ctx.scalar_functions.get(&self.name).ok_or_else(|| {
+            PyNameError::new_err(format!("function `{}` is not defined", self.name))
+        })?;
+
+        f_impl.invoke(py, &args)
+    }
+}
+
+impl<'p> ExecExpr<'p> for Tuple {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<PyObject> {
+        let args: Vec<_> = self
+            .elements
+            .iter()
+            .map(|expr| expr.execute(py, ctx, row))
+            .try_collect()?;
+
+        Ok(PyTuple::new_bound(py, args).unbind().into())
+    }
+}
+
+impl<'p> ExecExpr<'p> for List {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<PyObject> {
+        let args: Vec<_> = self
+            .elements
+            .iter()
+            .map(|expr| expr.execute(py, ctx, row))
+            .try_collect()?;
+
+        Ok(PyList::new_bound(py, args).unbind().into())
+    }
+}
+
+impl<'p> ExecExpr<'p> for Dict {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<PyObject> {
+        let items: Vec<_> = self
+            .items
+            .iter()
+            .map(|(k, v)| -> PyResult<_> {
+                Ok((k.execute(py, ctx, row)?, v.execute(py, ctx, row)?))
+            })
+            .try_collect()?;
+
+        Ok(items.into_py_dict_bound(py).unbind().into())
+    }
+}
+
+impl<'p> ExecExpr<'p> for GetItem {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<PyObject> {
+        let mut input = self.input.execute(py, ctx, row)?.into_bound(py);
+        for key in self.keys.iter() {
+            if input.is_none() {
+                break;
+            }
+            input = input.get_item(key.execute(py, ctx, row)?)?;
+        }
+
+        Ok(input.unbind())
     }
 }
