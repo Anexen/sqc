@@ -29,6 +29,9 @@ pub fn registry() -> Vec<Rc<dyn ScalarFunctionImpl>> {
     vec![
         Rc::new(type_conversion::ToString),
         Rc::new(type_conversion::ToInt),
+        Rc::new(type_conversion::ToTuple),
+        Rc::new(type_conversion::ToList),
+        Rc::new(type_conversion::ToDict),
         Rc::new(iterable::Length),
         Rc::new(math::Power),
         Rc::new(strings::Lowercase),

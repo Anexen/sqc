@@ -466,6 +466,8 @@ impl<'p> ExecExpr<'p> for BinaryExpr {
             Operator::Arrow => todo!(),
             Operator::Is => left.is(right).into_py(py),
             Operator::IsNot => (!left.is(right)).into_py(py),
+            Operator::BitAnd => left.bitand(right)?.into_py(py),
+            Operator::BitOr => left.bitor(right)?.into_py(py),
         };
 
         Ok(result.into())
@@ -490,6 +492,29 @@ impl<'p> ExecExpr<'p> for ScalarFunction {
         })?;
 
         f_impl.invoke(py, &args)
+    }
+}
+
+impl<'p> ExecExpr<'p> for MethodCall {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<PyObject> {
+        let args: Vec<_> = self
+            .args
+            .iter()
+            .map(|expr| expr.execute(py, ctx, row))
+            .try_collect()?;
+
+        let input = self.input.execute(py, ctx, row)?;
+
+        input.call_method1(
+            py,
+            PyString::new_bound(py, &self.name),
+            PyTuple::new_bound(py, args),
+        )
     }
 }
 
@@ -558,7 +583,37 @@ impl<'p> ExecExpr<'p> for GetItem {
             if input.is_none() {
                 break;
             }
-            input = input.get_item(key.execute(py, ctx, row)?)?;
+            if let Ok(item) = input.get_item(key.execute(py, ctx, row)?) {
+                input = item
+            } else {
+                input = py.None().into_bound(py);
+            }
+        }
+
+        Ok(input.unbind())
+    }
+}
+
+impl<'p> ExecExpr<'p> for GetAttr {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<PyObject> {
+        let mut input = self.input.execute(py, ctx, row)?.into_bound(py);
+        for key in self.keys.iter() {
+            if input.is_none() {
+                break;
+            }
+            let key = key.execute(py, ctx, row)?;
+            let key = key.downcast_bound::<PyString>(py).map_err(PyErr::from)?;
+
+            if let Ok(item) = input.getattr(key) {
+                input = item
+            } else {
+                input = py.None().into_bound(py);
+            }
         }
 
         Ok(input.unbind())

@@ -126,6 +126,10 @@ impl Dialect for PythonDialect {
                 parser.prev_token();
                 return Some(parse_dictionary_literal(parser));
             }
+            Token::LParen => {
+                parser.prev_token();
+                return Some(parse_maybe_tuple_literal(parser));
+            }
             _ => 1,
         };
 
@@ -183,12 +187,19 @@ fn parse_identity_operator(
 fn parse_dictionary_literal(parser: &mut Parser) -> Result<ast::Expr, ParserError> {
     parser.expect_token(&Token::LBrace)?;
 
-    let fields = ast::Expr::Array(ast::Array {
-        elem: parser.parse_comma_separated(parse_dictionary_field)?,
-        named: false,
-    });
+    let elements = if parser.peek_token().token == Token::RBrace {
+        // empty dict
+        vec![]
+    } else {
+        parser.parse_comma_separated(parse_dictionary_field)?
+    };
 
     parser.expect_token(&Token::RBrace)?;
+
+    let fields = ast::Expr::Array(ast::Array {
+        elem: elements,
+        named: false,
+    });
 
     Ok(function_call("dict", [fields]))
 }
@@ -198,6 +209,27 @@ fn parse_dictionary_field(parser: &mut Parser) -> Result<ast::Expr, ParserError>
     parser.expect_token(&Token::Colon)?;
     let value = parser.parse_expr()?;
     Ok(ast::Expr::Tuple(vec![key, value]))
+}
+
+fn parse_maybe_tuple_literal(parser: &mut Parser) -> Result<ast::Expr, ParserError> {
+    // (1) -> is not tuple
+    // (1,) -> is tuple
+
+    parser.expect_token(&Token::LParen)?;
+    let elements = parser.parse_comma_separated(|p| p.parse_expr())?;
+
+    if elements.len() == 1 {
+        // look back for trailing comma
+        parser.prev_token();
+        if parser.next_token().token != Token::Comma {
+            parser.expect_token(&Token::RParen)?;
+            return Ok(elements.into_iter().next().unwrap());
+        }
+    }
+
+    parser.expect_token(&Token::RParen)?;
+
+    Ok(ast::Expr::Tuple(elements))
 }
 
 fn function_call(name: &str, args: impl IntoIterator<Item = ast::Expr>) -> ast::Expr {

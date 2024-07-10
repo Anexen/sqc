@@ -282,12 +282,33 @@ impl Visitor {
                 .expr(self.visit_expr(expr)?)
                 .build()?
                 .into(),
-            ast::Expr::BinaryOp { left, op, right } => BinaryExprBuilder::default()
-                .left(self.visit_expr(left)?)
-                .op(self.visit_binary_op(op)?)
-                .right(self.visit_expr(right)?)
-                .build()?
-                .into(),
+            ast::Expr::BinaryOp { left, op, right } => {
+                let left = self.visit_expr(left)?;
+                let op = self.visit_binary_op(op)?;
+                let right = self.visit_expr(right)?;
+
+                match (left, op, right) {
+                    (left, Operator::Arrow, Expr::Column(c)) => GetAttrBuilder::default()
+                        .input(left)
+                        .keys(vec![self.make_literal(c.name.to_string())])
+                        .build()?
+                        .into(),
+                    (left, Operator::Arrow, Expr::ScalarFunction(f)) => {
+                        MethodCallBuilder::default()
+                            .input(left)
+                            .name(f.name)
+                            .args(f.args)
+                            .build()?
+                            .into()
+                    }
+                    (left, op, right) => BinaryExprBuilder::default()
+                        .left(left)
+                        .op(op)
+                        .right(right)
+                        .build()?
+                        .into(),
+                }
+            }
             ast::Expr::Value(value) => self.visit_value(value)?,
             ast::Expr::Named { expr, name } => AliasBuilder::default()
                 .expr(self.visit_expr(expr)?)
@@ -300,10 +321,9 @@ impl Visitor {
                     _ => unimplemented!("{expr:?}"),
                 };
 
-                BinaryExprBuilder::default()
-                    .left(self.visit_expr(expr)?)
-                    .op(Operator::Arrow)
-                    .right(self.visit_expr(right)?)
+                GetItemBuilder::default()
+                    .input(self.visit_expr(expr)?)
+                    .keys(vec![self.visit_expr(right)?])
                     .build()?
                     .into()
             }
@@ -416,6 +436,8 @@ impl Visitor {
             And => Operator::And,
             Or => Operator::Or,
             Arrow => Operator::Arrow,
+            BitwiseAnd => Operator::BitAnd,
+            BitwiseOr => Operator::BitOr,
             _ => unimplemented!("{op}"),
         })
     }
@@ -454,6 +476,11 @@ impl Visitor {
             LogicalPlan::Limit(v) => self.get_table_ref(&v.input)?,
         };
         Ok(table_ref)
+    }
+
+    fn make_literal<T: IntoPy<PyObject>>(&self, value: T) -> Expr {
+        let value = Python::with_gil(|py| value.into_py(py));
+        Expr::Literal(Rc::new(value))
     }
 
     fn split_eq_and_noneq_join_predicate(

@@ -1,4 +1,14 @@
 #[macro_export]
+macro_rules! query {
+    ($query:expr) => {
+        ::pyo3::Python::with_gil(|py| ::sqc::query(py, $query, None))
+    };
+    ($query:expr, $ctx:expr) => {
+        ::pyo3::Python::with_gil(|py| ::sqc::query(py, $query, Some($ctx.into())))
+    };
+}
+
+#[macro_export]
 macro_rules! py_assert_eq {
     ($a:expr, $b:expr) => {
         use ::pyo3::types::PyAnyMethods;
@@ -22,8 +32,73 @@ macro_rules! py {
 #[macro_export]
 macro_rules! py_internal {
     //////////////////////////////////////////////////////////////////////////
-    // TT muncher for parsing the inside of an array [...]. Produces a vec![...]
-    // of the elements.
+    // TT muncher for parsing the inside of an tuple.
+    //
+    // Must be invoked as: py_internal!(@tuple () $($tt)*)
+    //////////////////////////////////////////////////////////////////////////
+
+    // Done with trailing comma.
+    (@tuple ($($elems:expr,)*)) => {
+        py_internal_vec![$($elems,)*]
+    };
+
+    // Done without trailing comma.
+    (@tuple ($($elems:expr),*)) => {
+        py_internal_vec![$($elems),*]
+    };
+
+    // Next element is `null`.
+    (@tuple ($($elems:expr,)*) None $($rest:tt)*) => {
+        py_internal!(@tuple ($($elems,)* py_internal!(None)) $($rest)*)
+    };
+
+    // Next element is `true`.
+    (@tuple ($($elems:expr,)*) True $($rest:tt)*) => {
+        py_internal!(@tuple ($($elems,)* py_internal!(True)) $($rest)*)
+    };
+
+    // Next element is `false`.
+    (@tuple ($($elems:expr,)*) False $($rest:tt)*) => {
+        py_internal!(@tuple ($($elems,)* py_internal!(False)) $($rest)*)
+    };
+
+    // Next element is an array.
+    (@tuple ($($elems:expr,)*) [$($array:tt)*] $($rest:tt)*) => {
+        py_internal!(@tuple ($($elems,)* py_internal!([$($array)*])) $($rest)*)
+    };
+
+    // Next element is a map.
+    (@tuple ($($elems:expr,)*) {$($map:tt)*} $($rest:tt)*) => {
+        py_internal!(@tuple ($($elems,)* py_internal!({$($map)*})) $($rest)*)
+    };
+
+    // Next element is a tuple.
+    (@tuple ($($elems:expr,)*) ($($tuple:tt)*) $($rest:tt)*) => {
+        py_internal!(@tuple ($($elems,)* py_internal!(($($tuple)*))) $($rest)*)
+    };
+
+    // Next element is an expression followed by comma.
+    (@tuple ($($elems:expr,)*) $next:expr, $($rest:tt)*) => {
+        py_internal!(@tuple ($($elems,)* py_internal!($next),) $($rest)*)
+    };
+
+    // Last element is an expression with no trailing comma.
+    (@tuple ($($elems:expr,)*) $last:expr) => {
+        py_internal!(@tuple ($($elems,)* py_internal!($last)))
+    };
+
+    // Comma after the most recent element.
+    (@tuple ($($elems:expr),*) , $($rest:tt)*) => {
+        py_internal!(@tuple ($($elems,)*) $($rest)*)
+    };
+
+    // Unexpected token after most recent element.
+    (@tuple ($($elems:expr),*) $unexpected:tt $($rest:tt)*) => {
+        py_unexpected!($unexpected)
+    };
+
+    //////////////////////////////////////////////////////////////////////////
+    // TT muncher for parsing the inside of an array [...].
     //
     // Must be invoked as: py_internal!(@array [] $($tt)*)
     //////////////////////////////////////////////////////////////////////////
@@ -61,6 +136,11 @@ macro_rules! py_internal {
     // Next element is a map.
     (@array [$($elems:expr,)*] {$($map:tt)*} $($rest:tt)*) => {
         py_internal!(@array [$($elems,)* py_internal!({$($map)*})] $($rest)*)
+    };
+
+    // Next element is a tuple.
+    (@array [$($elems:expr,)*] ($($tuple:tt)*) $($rest:tt)*) => {
+        py_internal!(@tuple ($($elems,)* py_internal!(($($tuple)*))) $($rest)*)
     };
 
     // Next element is an expression followed by comma.
@@ -132,6 +212,11 @@ macro_rules! py_internal {
         py_internal!(@object $object [$($key)+] (py_internal!([$($array)*])) $($rest)*);
     };
 
+    // Next value is a tuple.
+    (@object $object:ident ($($key:tt)+) (: ($($tuple:tt)*) $($rest:tt)*) $copy:tt) => {
+        py_internal!(@object $object [$($key)+] (py_internal!(($($tuple)*))) $($rest)*);
+    };
+
     // Next value is a map.
     (@object $object:ident ($($key:tt)+) (: {$($map:tt)*} $($rest:tt)*) $copy:tt) => {
         py_internal!(@object $object [$($key)+] (py_internal!({$($map)*})) $($rest)*);
@@ -195,27 +280,44 @@ macro_rules! py_internal {
     //////////////////////////////////////////////////////////////////////////
 
     (None) => {
-        None::<Option<u8>>
+        ::pyo3::Python::with_gil(|py| { py.None() })
     };
 
     (True) => {
-        true
+        ::pyo3::Python::with_gil(|py| { true.into_py(py) })
     };
 
     (False) => {
-        false
+        ::pyo3::Python::with_gil(|py| { false.into_py(py) })
+    };
+
+    (()) => {
+        ::pyo3::Python::with_gil(|py| {
+            use ::pyo3::{IntoPy};
+            ::pyo3::types::PyTuple::empty_bound(py).unbind().into_py(py)
+        })
+    };
+
+    (( $($tt:tt)+ )) => {
+        ::pyo3::Python::with_gil(|py| {
+            use ::pyo3::{IntoPy};
+            let _items = py_internal!(@array [] $($tt)+);
+            ::pyo3::types::PyTuple::new_bound(py, _items).unbind().into_py(py)
+        })
     };
 
     ([]) => {
         ::pyo3::Python::with_gil(|py| {
-            ::pyo3::types::PyList::empty_bound(py).unbind()
+            use ::pyo3::{IntoPy};
+            ::pyo3::types::PyList::empty_bound(py).unbind().into_py(py)
         })
     };
 
     ([ $($tt:tt)+ ]) => {
         ::pyo3::Python::with_gil(|py| {
+            use ::pyo3::{IntoPy};
             let _items = py_internal!(@array [] $($tt)+);
-            ::pyo3::types::PyList::new_bound(py, _items).unbind()
+            ::pyo3::types::PyList::new_bound(py, _items).unbind().into_py(py)
         })
     };
 

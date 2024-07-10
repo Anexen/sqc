@@ -185,6 +185,8 @@ pub enum Expr {
     List(List),
     Dict(Dict),
     GetItem(GetItem),
+    GetAttr(GetAttr),
+    MethodCall(MethodCall),
 }
 
 #[derive(Clone, Builder)]
@@ -266,6 +268,25 @@ impl fmt::Display for GetItem {
 
 #[derive(Clone, Builder)]
 #[cfg_attr(debug_assertions, derive(Debug))]
+#[builder(build_fn(error = "PlanError"))]
+pub struct GetAttr {
+    #[builder(setter(into))]
+    pub input: Box<Expr>,
+    pub keys: Vec<Expr>,
+}
+
+impl fmt::Display for GetAttr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{}",
+            self.input,
+            self.keys.iter().map(|e| e.to_string()).join(".")
+        )
+    }
+}
+#[derive(Clone, Builder)]
+#[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct ScalarFunction {
     pub name: String,
@@ -277,6 +298,27 @@ impl fmt::Display for ScalarFunction {
         write!(
             f,
             "{}({})",
+            self.name,
+            self.args.iter().map(|e| e.to_string()).join(", ")
+        )
+    }
+}
+
+#[derive(Clone, Builder)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[builder(build_fn(error = "PlanError"), setter(into))]
+pub struct MethodCall {
+    pub input: Box<Expr>,
+    pub name: String,
+    pub args: Vec<Expr>,
+}
+
+impl fmt::Display for MethodCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}.{}({})",
+            self.input,
             self.name,
             self.args.iter().map(|e| e.to_string()).join(", ")
         )
@@ -393,6 +435,10 @@ pub enum Operator {
     Is,
     #[display(fmt = "is not")]
     IsNot,
+    #[display(fmt = "&")]
+    BitAnd,
+    #[display(fmt = "|")]
+    BitOr,
 }
 
 #[derive(Clone, Display)]
@@ -446,9 +492,13 @@ impl Expr {
                     v.extract_columns_impl(columns);
                 });
             }
-            Expr::GetItem(v) => {
+            Expr::GetItem(GetItem { input, keys }) | Expr::GetAttr(GetAttr { input, keys }) => {
+                input.extract_columns_impl(columns);
+                keys.iter().for_each(|k| k.extract_columns_impl(columns));
+            }
+            Expr::MethodCall(v) => {
                 v.input.extract_columns_impl(columns);
-                v.keys.iter().for_each(|k| k.extract_columns_impl(columns));
+                v.args.iter().for_each(|a| a.extract_columns_impl(columns));
             }
         };
     }

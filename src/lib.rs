@@ -148,10 +148,10 @@ fn try_extract_variables_from_scope(
         };
 
         if value.is_callable() {
-            ctx.add_scalar_udf(name, value.unbind())
-        } else {
-            ctx.add_table(name, value.unbind());
+            ctx.add_scalar_udf(name, value.clone().unbind())
         }
+
+        ctx.add_table(name, value.unbind());
     }
 
     Ok(())

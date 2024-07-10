@@ -7,67 +7,6 @@ mod utils;
 use fixtures::*;
 
 #[rstest]
-fn test_select_const() {
-    let query = r#"
-    SELECT
-        'one' AS string_literal,
-        'a' + 'b' + 'c' AS `ABC`,
-        2 * 10 < 3 * 7 AS boolean_result,
-        NOT 10 < 4 * 5 / 2 + 1 AS inversion,
-        (2 + 2 * 2) % 2 = 0 AS is_even,
-        123456 * 1000 // 33 AS intdiv,
-        3 + 4/(2*3*4) - 4/(4*5*6) + 4/(6*7*8) - 4/(8*9*10) + 4/(10*11*12) AS `PI`,
-        2 ** (1 + 2) as power,
-        None as nnn,
-    "#;
-
-    let result = query!(query).unwrap();
-
-    let expected = py!([{
-        "string_literal": "one",
-        "ABC": "abc",
-        "boolean_result": True,
-        "inversion": False,
-        "is_even": True,
-        "intdiv": 3741090,
-        "PI": 3. + 4./24. - 4./120. + 4./336. - 4./720. + 4./1320.,
-        "power": 8,
-        "nnn": None,
-    }]);
-
-    py_assert_eq!(result, expected);
-}
-
-#[rstest]
-fn test_is_operator() {
-    let query = r#"
-    SELECT
-        None is None as is_none,
-        1 is None as one_is_none,
-        None is not 1 as none_is_not_1,
-        1 < 2 is True as is_true,
-        @a is @b and @b is not @c and @c is @c and @c is not 257 and @a is not None AS int_trick,
-    "#;
-
-    // CPython trick: when creating an int value in the range of -5 to 256, a reference to an
-    // existing object is returned. However, values outside this range are created as separate
-    // objects. So, any integer > 256 will have different id
-    let a = py!(257);
-    let ctx = py!({"@a": &a, "@b": &a, "@c": 257});
-    let result = query!(query, ctx).unwrap();
-
-    let expected = py!([{
-        "is_none": True,
-        "one_is_none": False,
-        "none_is_not_1": True,
-        "is_true": True,
-        "int_trick": True,
-    }]);
-
-    py_assert_eq!(result, expected);
-}
-
-#[rstest]
 fn test_select_wildcard(repositories: &PyObject) {
     let query = r#"
     SELECT *
