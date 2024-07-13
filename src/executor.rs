@@ -1,19 +1,23 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     rc::Rc,
 };
 
 use ambassador::delegatable_trait;
-use indexmap::IndexMap;
 use itertools::Itertools;
-use pyo3::{exceptions::PyNameError, prelude::*, types::*};
+use pyo3::{prelude::*, types::*};
 
-use crate::{functions::scalar::ScalarFunctionImpl, logical_plan::*};
-use crate::{functions::scalar::ScalarUDF, stream::*};
+use crate::{
+    functions::scalar::{ScalarUDF, Volatility},
+    logical_plan::*,
+    stream::{IndexMap, *},
+};
 
 pub struct ExecutionContext {
     tables: HashMap<String, PyObject>,
-    scalar_functions: HashMap<String, Rc<dyn ScalarFunctionImpl>>,
+    scalar_functions: HashMap<Identifier, ScalarUDF>,
+    result_cache: RefCell<HashMap<Identifier, PyObject>>,
 }
 
 impl Default for ExecutionContext {
@@ -21,13 +25,11 @@ impl Default for ExecutionContext {
         Self {
             tables: HashMap::new(),
             scalar_functions: crate::functions::scalar::registry()
+                .unwrap()
                 .into_iter()
-                .flat_map(|f| {
-                    f.names()
-                        .into_iter()
-                        .map(move |s| (s.to_string(), Rc::clone(&f)))
-                })
+                .map(|f| (f.name.clone(), f))
                 .collect(),
+            result_cache: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -38,8 +40,10 @@ impl ExecutionContext {
     }
 
     pub fn add_scalar_udf(&mut self, name: &str, function: PyObject) {
-        self.scalar_functions
-            .insert(name.to_string(), Rc::new(ScalarUDF::new(function)));
+        self.scalar_functions.insert(
+            Identifier::new(name.to_string()),
+            ScalarUDF::volatile(name, function),
+        );
     }
 
     pub fn add_table(&mut self, name: &str, data: PyObject) {
@@ -51,19 +55,14 @@ impl ExecutionContext {
         py: Python<'p>,
         table_name: &'p TableReference,
     ) -> PyResult<Stream<'p>> {
-        let inner = self.tables.get(table_name.0.as_ref()).ok_or_else(|| {
-            PyNameError::new_err(format!("table `{}` is not defined", table_name))
-        })?;
+        let inner = self
+            .tables
+            .get(table_name.0.as_ref())
+            .ok_or_else(|| NameError!("table `{}` is not defined", table_name))?;
 
-        let stream = inner.bind(py).iter()?.map(|obj| match obj {
-            Ok(obj) => obj.downcast::<PyDict>().map_err(|e| e.into()).map(|row| {
-                let data = row
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v.unbind()))
-                    .collect();
-                [(table_name.clone(), data)].into()
-            }),
-            Err(e) => Err(e),
+        let stream = inner.bind(py).iter()?.map_then(|obj| {
+            obj.extract::<IndexMap<Identifier, PyObject>>()
+                .map(|row| IndexMap::from_iter([(table_name.clone(), row)]))
         });
 
         Ok(Stream::new(stream))
@@ -73,7 +72,7 @@ impl ExecutionContext {
 pub fn execute_plan<'p>(
     py: Python<'p>,
     plan: &'p LogicalPlan,
-    ctx: &'p ExecutionContext,
+    ctx: &'p mut ExecutionContext,
 ) -> PyResult<Stream<'p>> {
     plan.execute(py, ctx)
 }
@@ -99,19 +98,18 @@ pub trait ExecExpr<'p> {
 
 impl<'p> Exec<'p> for Projection {
     fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> PyResult<Stream<'p>> {
+        let table_ref = TableReference::default();
+
         let data = self.input.execute(py, ctx)?.map_then(move |row| {
             let data = self
                 .expr
                 .iter()
-                .map(|(name, expr)| -> PyResult<Vec<(String, PyObject)>> {
+                .map(|(name, expr)| -> PyResult<Vec<(Identifier, PyObject)>> {
                     match expr {
                         Expr::Wildcard(wildcard) => match wildcard.table.as_ref() {
                             Some(table_ref) => {
                                 let part = row.get(table_ref).ok_or_else(|| {
-                                    PyNameError::new_err(format!(
-                                        "table `{}` is not defined",
-                                        table_ref
-                                    ))
+                                    NameError!("table `{}` is not defined", table_ref)
                                 })?;
 
                                 Ok(part
@@ -132,7 +130,7 @@ impl<'p> Exec<'p> for Projection {
                 .flatten_ok();
 
             let part: IndexMap<_, _> = data.try_collect()?;
-            Ok([(TableReference::default(), part)].into())
+            Ok(IndexMap::from_iter([(table_ref.clone(), part)]))
         });
 
         Ok(Stream::new(data))
@@ -227,19 +225,19 @@ impl<'p> Exec<'p> for Join {
             let value = PyTuple::new_bound(py, join_keys);
             let key = value.hash().unwrap();
 
-            let mut result: Row = IndexMap::new();
+            let mut result: Row = IndexMap::default();
 
             for (table_ref, data) in hash_table.get(&key)? {
                 result
                     .entry(table_ref.clone())
-                    .or_insert(IndexMap::new())
+                    .or_insert(IndexMap::default())
                     .extend(data.iter().map(|(k, v)| (k.clone(), v.clone_ref(py))));
             }
 
             for (table_ref, data) in x.into_iter() {
                 result
                     .entry(table_ref)
-                    .or_insert(IndexMap::new())
+                    .or_insert(IndexMap::default())
                     .extend(data);
             }
             Some(result)
@@ -273,7 +271,7 @@ impl<'p> Exec<'p> for Filter {
 impl<'p> Exec<'p> for EmptyRelation {
     fn execute(&'p self, _py: Python<'p>, _ctx: &'p ExecutionContext) -> PyResult<Stream<'p>> {
         let table_ref = TableReference::default();
-        let row = [(table_ref, IndexMap::new())].into();
+        let row = IndexMap::from_iter([(table_ref, Default::default())]);
         let data = vec![Ok(row)];
         Ok(Stream::new(data))
     }
@@ -342,14 +340,12 @@ impl<'p> ExecExpr<'p> for Column {
         ctx: &'p ExecutionContext,
         row: &'p Row,
     ) -> PyResult<PyObject> {
-        if self.name.starts_with('@') {
+        if self.name.0.starts_with('@') {
             return ctx
                 .tables
-                .get(self.name.as_ref())
+                .get(self.name.0.as_ref())
                 .map(|v| v.clone_ref(py))
-                .ok_or_else(|| {
-                    PyNameError::new_err(format!("variable `{}` is not defined", self.name))
-                });
+                .ok_or_else(|| NameError!("variable `{}` is not defined", self.name));
         }
 
         let table_ref = match self.relation.as_ref() {
@@ -357,32 +353,22 @@ impl<'p> ExecExpr<'p> for Column {
             None => {
                 let candidates = row
                     .iter()
-                    .filter_map(|(k, v)| v.contains_key(self.name.as_ref()).then_some(k))
+                    .filter_map(|(k, v)| v.contains_key(&self.name).then_some(k))
                     .take(2)
                     .collect_vec();
 
                 match candidates.len() {
-                    0 => {
-                        return Err(PyNameError::new_err(format!(
-                            "column `{}` is not defined",
-                            self.name
-                        )))
-                    }
+                    0 => return Err(NameError!("column `{}` is not defined", self.name)),
                     1 => candidates[0],
-                    _ => {
-                        return Err(PyNameError::new_err(format!(
-                            "column `{}` is ambiguous",
-                            self.name
-                        )))
-                    }
+                    _ => return Err(NameError!("column `{}` is ambiguous", self.name)),
                 }
             }
         };
         let part = row
             .get(table_ref)
-            .ok_or_else(|| PyNameError::new_err(format!("table `{}` is not defined", table_ref)))?;
+            .ok_or_else(|| NameError!("table `{}` is not defined", table_ref))?;
 
-        let result = match part.get(self.name.as_ref()) {
+        let result = match part.get(&self.name) {
             Some(x) => x.into_py(py),
             None => return Ok(py.None()),
         };
@@ -481,17 +467,37 @@ impl<'p> ExecExpr<'p> for ScalarFunction {
         ctx: &'p ExecutionContext,
         row: &'p Row,
     ) -> PyResult<PyObject> {
+        let f_impl = ctx
+            .scalar_functions
+            .get(&self.name)
+            .ok_or_else(|| NameError!("function `{}` is not defined", self.name))?;
+
+        if f_impl.volatility == Volatility::Stable {
+            return match ctx.result_cache.borrow_mut().entry(f_impl.name.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => Ok(e.get().clone_ref(py)),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    Ok(e.insert(f_impl.inner.call0(py)?).clone_ref(py))
+                }
+            };
+        };
+
         let args: Vec<_> = self
             .args
             .iter()
             .map(|expr| expr.execute(py, ctx, row))
             .try_collect()?;
 
-        let f_impl = ctx.scalar_functions.get(&self.name).ok_or_else(|| {
-            PyNameError::new_err(format!("function `{}` is not defined", self.name))
-        })?;
+        let kwargs: Vec<_> = self
+            .kwargs
+            .iter()
+            .map(|(k, v)| -> PyResult<_> { Ok((k.clone(), v.execute(py, ctx, row)?)) })
+            .try_collect()?;
 
-        f_impl.invoke(py, &args)
+        f_impl.inner.call_bound(
+            py,
+            PyTuple::new_bound(py, args),
+            Some(&kwargs.into_py_dict_bound(py)),
+        )
     }
 }
 
@@ -512,7 +518,7 @@ impl<'p> ExecExpr<'p> for MethodCall {
 
         input.call_method1(
             py,
-            PyString::new_bound(py, &self.name),
+            PyString::new_bound(py, self.name.0.as_ref()),
             PyTuple::new_bound(py, args),
         )
     }

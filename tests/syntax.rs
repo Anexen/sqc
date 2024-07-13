@@ -18,6 +18,7 @@ fn test_select_const() {
         3 + 4/(2*3*4) - 4/(4*5*6) + 4/(6*7*8) - 4/(8*9*10) + 4/(10*11*12) AS `PI`,
         2 ** (1 + 2) as power,
         None as is_none,
+        0.75 -> as_integer_ratio()[0] as numerator,
     "#;
 
     let result = query!(query).unwrap();
@@ -32,6 +33,7 @@ fn test_select_const() {
         "PI": 3. + 4./24. - 4./120. + 4./336. - 4./720. + 4./1320.,
         "power": 8,
         "is_none": None,
+        "numerator": 3,
     }]);
 
     py_assert_eq!(result, expected);
@@ -53,6 +55,7 @@ fn test_is_operator() {
     // objects. So, any integer > 256 will have different id
     let a = py!(257);
     let ctx = py!({"@a": &a, "@b": &a, "@c": 257});
+
     let result = query!(query, ctx).unwrap();
 
     let expected = py!([{
@@ -92,7 +95,7 @@ fn test_tuples() {
         "is_not_tuple": 3,
         "trailing_comma": (3,),
         "heterogeneous": (6, "2", False, None),
-        "nested": (1, (2, 3, 4), 5),  // 3 is not in a tuple
+        "nested": (1, (2, 3, 4), 5),  // 3 is not a tuple
         "access": "d",
         "negative_access": 4,
         "out_of_bound": None,

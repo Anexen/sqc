@@ -23,7 +23,7 @@ build-backend = "maturin"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-strip = true
+# strip = true
 include = [
     { path = "pyproject.toml", format = ["sdist", "wheel"] },
     { path = "Cargo.toml", format = "sdist" },

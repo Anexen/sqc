@@ -1,13 +1,13 @@
 use ambassador::Delegate;
 use derive_builder::{Builder, UninitializedFieldError};
 use derive_more::{Display, Error, From};
-use indexmap::IndexMap;
 use itertools::Itertools;
-use pyo3::PyObject;
+use pyo3::{FromPyObject, PyObject};
 use std::fmt;
 use std::rc::Rc;
 
 use crate::executor::{ambassador_impl_Exec, ambassador_impl_ExecExpr, Exec, ExecExpr};
+use crate::stream::IndexMap;
 
 #[derive(Debug, Error, Display)]
 #[display(fmt = "{_0}")]
@@ -18,6 +18,47 @@ impl From<UninitializedFieldError> for PlanError {
         PlanError(e.to_string())
     }
 }
+
+#[derive(Clone, Display, Debug, Eq, Hash, PartialEq)]
+#[display(fmt = "{_0}")]
+pub struct Identifier(pub Rc<String>);
+
+impl Identifier {
+    pub fn new(value: String) -> Self {
+        Self(Rc::new(value))
+    }
+}
+
+impl<'p> FromPyObject<'p> for Identifier {
+    fn extract_bound(ob: &pyo3::Bound<'p, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let value = pyo3::types::PyAnyMethods::extract::<String>(ob)?;
+        Ok(Self::new(value))
+    }
+}
+
+impl pyo3::IntoPy<PyObject> for Identifier {
+    fn into_py(self, py: pyo3::Python<'_>) -> PyObject {
+        pyo3::types::PyString::new_bound(py, self.0.as_ref()).into()
+    }
+}
+
+impl pyo3::ToPyObject for Identifier {
+    fn to_object(&self, py: pyo3::Python<'_>) -> PyObject {
+        pyo3::types::PyString::new_bound(py, self.0.as_ref()).into()
+    }
+}
+
+impl From<String> for Identifier {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+// impl<'p> FromPyObjectBound<'_, 'p> for Identifier {
+//     fn from_py_object_bound(ob: Borrowed<'_, 'p, PyAny>) -> PyResult<Self> {
+//         Self::extract_bound(&ob)
+//     }
+// }
 
 #[derive(Clone, From, Delegate)]
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -95,7 +136,7 @@ impl Default for TableReference {
 )]
 pub struct Column {
     #[builder(setter(into))]
-    pub name: Rc<String>,
+    pub name: Identifier,
     #[builder(default)]
     pub relation: Option<TableReference>,
 }
@@ -122,7 +163,7 @@ pub struct SubqueryAlias {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct Projection {
-    pub expr: IndexMap<String, Expr>,
+    pub expr: IndexMap<Identifier, Expr>,
     pub input: Rc<LogicalPlan>,
 }
 
@@ -279,7 +320,7 @@ impl fmt::Display for GetAttr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}{}",
+            "{}.{}",
             self.input,
             self.keys.iter().map(|e| e.to_string()).join(".")
         )
@@ -289,8 +330,10 @@ impl fmt::Display for GetAttr {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct ScalarFunction {
-    pub name: String,
+    pub name: Identifier,
     pub args: Vec<Expr>,
+    #[builder(default)]
+    pub kwargs: IndexMap<Identifier, Expr>,
 }
 
 impl fmt::Display for ScalarFunction {
@@ -309,7 +352,7 @@ impl fmt::Display for ScalarFunction {
 #[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct MethodCall {
     pub input: Box<Expr>,
-    pub name: String,
+    pub name: Identifier,
     pub args: Vec<Expr>,
 }
 

@@ -1,9 +1,11 @@
-use indexmap::IndexMap;
 use pyo3::{PyErr, PyObject};
 
-use crate::logical_plan::TableReference;
+use crate::logical_plan::{Identifier, TableReference};
 
-pub type RowPart = IndexMap<String, PyObject>;
+pub type IndexMap<K, V> = indexmap::IndexMap<K, V, fxhash::FxBuildHasher>;
+// pub type IndexMap<K, V> = indexmap::IndexMap<K, V>;
+
+pub type RowPart = IndexMap<Identifier, PyObject>;
 pub type Row = IndexMap<TableReference, RowPart>;
 
 pub struct Stream<'s, E = PyErr> {

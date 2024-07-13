@@ -68,7 +68,7 @@ impl Dialect for PythonDialect {
     }
 
     fn supports_named_fn_args_with_eq_operator(&self) -> bool {
-        false // TODO (kwargs)
+        true // kwargs
     }
 
     fn supports_dictionary_syntax(&self) -> bool {
@@ -83,6 +83,13 @@ impl Dialect for PythonDialect {
         false // TODO
     }
 
+    fn get_next_precedence(&self, parser: &Parser) -> Option<Result<u8, ParserError>> {
+        match parser.peek_token().token {
+            Token::Arrow => Some(Ok(100)),
+            _ => None,
+        }
+    }
+
     fn parse_infix(
         &self,
         parser: &mut Parser,
@@ -92,7 +99,10 @@ impl Dialect for PythonDialect {
         let steps_back = match parser.next_token().token {
             Token::Mul => match parser.next_token().token {
                 Token::Mul => return Some(parse_power_operator(parser, expr, precedence)),
-                _ => 2,
+                w => {
+                    println!("W: {}, NEXT: {}", w, parser.peek_token());
+                    2
+                }
             },
             // handle integer division
             Token::Div => match parser.next_token().token {

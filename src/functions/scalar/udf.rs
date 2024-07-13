@@ -1,31 +1,33 @@
-use pyo3::{prelude::*, types::PyTuple};
+use pyo3::prelude::*;
 
-use super::{ScalarFunctionImpl, Volatility};
+use crate::logical_plan::Identifier;
+
+use super::Volatility;
 
 #[derive(Debug)]
 pub struct ScalarUDF {
-    inner: PyObject,
+    pub name: Identifier,
+    pub volatility: Volatility,
+    pub inner: PyObject,
 }
 
 impl ScalarUDF {
-    pub fn new(inner: PyObject) -> Self {
-        Self { inner }
+    pub fn new(name: Identifier, volatility: Volatility, inner: PyObject) -> Self {
+        Self {
+            name,
+            volatility,
+            inner,
+        }
     }
-}
-
-impl ScalarFunctionImpl for ScalarUDF {
-    fn names(&self) -> Vec<&'static str> {
-        vec![]
-    }
-
-    fn volatility(&self) -> Volatility {
-        Volatility::Volatile
+    pub fn volatile<T: ToString>(name: T, inner: PyObject) -> Self {
+        Self::new(name.to_string().into(), Volatility::Volatile, inner)
     }
 
-    fn invoke(&self, py: Python<'_>, args: &[PyObject]) -> PyResult<PyObject> {
-        self.inner
-            .bind(py)
-            .call1(PyTuple::new_bound(py, args))
-            .map(|v| v.unbind())
+    pub fn immutable<T: ToString>(name: T, inner: PyObject) -> Self {
+        Self::new(name.to_string().into(), Volatility::Immutable, inner)
+    }
+
+    pub fn stable<T: ToString>(name: T, inner: PyObject) -> Self {
+        Self::new(name.to_string().into(), Volatility::Stable, inner)
     }
 }

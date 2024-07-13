@@ -113,7 +113,7 @@ fn test_function_call(users: &PyObject) {
     let query = r#"
     SELECT id, login
     FROM users
-    WHERE length(login) > 15
+    WHERE len(login) > 15
     LIMIT 3
     "#;
 

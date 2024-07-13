@@ -1,7 +1,6 @@
 use itertools::Itertools;
 use std::{any::Any, rc::Rc};
 
-use indexmap::IndexMap;
 use pyo3::{
     prelude::*,
     types::{PyFloat, PyLong},
@@ -10,6 +9,7 @@ use pyo3::{
 use sqlparser::ast;
 
 use crate::logical_plan::*;
+use crate::stream::IndexMap;
 
 type PlanResult<T = LogicalPlan> = Result<T, PlanError>;
 type EquijoinPredicate = (Expr, Expr);
@@ -228,27 +228,27 @@ impl Visitor {
     fn visit_projection(
         &mut self,
         projection: &[ast::SelectItem],
-    ) -> PlanResult<IndexMap<String, Expr>> {
+    ) -> PlanResult<IndexMap<Identifier, Expr>> {
         projection
             .iter()
-            .map(|x| -> PlanResult<(String, Expr)> {
+            .map(|x| -> PlanResult<(Identifier, Expr)> {
                 use ast::SelectItem;
                 match x {
                     SelectItem::UnnamedExpr(expr) => {
                         let result = self.visit_expr(expr)?;
-                        Ok((format!("{result}"), result))
+                        Ok((format!("{result}").into(), result))
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
-                        Ok((alias.value.clone(), self.visit_expr(expr)?))
+                        Ok((alias.value.clone().into(), self.visit_expr(expr)?))
                     }
                     SelectItem::Wildcard(_) => {
                         let result = WildcardBuilder::default().build()?.into();
-                        Ok(("*".to_string(), result))
+                        Ok(("*".to_string().into(), result))
                     }
                     SelectItem::QualifiedWildcard(object_name, _) => {
                         let table_ref = TableReference(object_name.to_string().into());
                         let result = WildcardBuilder::default().table(table_ref).build()?.into();
-                        Ok((object_name.to_string(), result))
+                        Ok((object_name.to_string().into(), result))
                     }
                 }
             })
@@ -332,10 +332,11 @@ impl Visitor {
                 if name.starts_with('@') {
                     self.external_names.push(name.clone())
                 }
-
+                let (args, kwargs) = self.visit_function_arguments(&function.args)?;
                 ScalarFunctionBuilder::default()
                     .name(name)
-                    .args(self.visit_function_arguments(&function.args)?)
+                    .args(args)
+                    .kwargs(kwargs)
                     .build()?
                     .into()
             }
@@ -390,22 +391,41 @@ impl Visitor {
         Ok(result)
     }
 
-    fn visit_function_arguments(&mut self, args: &ast::FunctionArguments) -> PlanResult<Vec<Expr>> {
+    fn visit_function_arguments(
+        &mut self,
+        args: &ast::FunctionArguments,
+    ) -> PlanResult<(Vec<Expr>, IndexMap<Identifier, Expr>)> {
+        let mut positional = Vec::new();
+        let mut keyword = IndexMap::default();
+
         match args {
-            ast::FunctionArguments::None => Ok(vec![]),
+            ast::FunctionArguments::None => {}
             ast::FunctionArguments::Subquery(_) => todo!(),
-            ast::FunctionArguments::List(arg_list) => arg_list
-                .args
-                .iter()
-                .map(|a| match a {
-                    ast::FunctionArg::Named { .. } => todo!(),
-                    ast::FunctionArg::Unnamed(unnamed) => match unnamed {
-                        ast::FunctionArgExpr::Expr(e) => self.visit_expr(e),
-                        ast::FunctionArgExpr::QualifiedWildcard(_) => todo!(),
-                        ast::FunctionArgExpr::Wildcard => todo!(),
-                    },
-                })
-                .collect(),
+            ast::FunctionArguments::List(arg_list) => {
+                for arg in arg_list.args.iter() {
+                    match arg {
+                        ast::FunctionArg::Named { name, arg, .. } => {
+                            keyword.insert(
+                                Identifier::new(name.to_string()),
+                                self.visit_function_arg_expr(arg)?,
+                            );
+                        }
+                        ast::FunctionArg::Unnamed(arg) => {
+                            positional.push(self.visit_function_arg_expr(arg)?);
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok((positional, keyword))
+    }
+
+    fn visit_function_arg_expr(&mut self, arg: &ast::FunctionArgExpr) -> PlanResult<Expr> {
+        match arg {
+            ast::FunctionArgExpr::Expr(e) => self.visit_expr(e),
+            ast::FunctionArgExpr::QualifiedWildcard(_) => todo!(),
+            ast::FunctionArgExpr::Wildcard => todo!(),
         }
     }
 

@@ -1,11 +1,14 @@
 use derive_more::{Display, Error, From};
+use itertools::Itertools;
 // use optimizer::Optimizer;
 use pyo3::{
     create_exception,
-    exceptions::PyNameError,
     prelude::*,
     types::{IntoPyDict as _, PyDict},
 };
+
+#[macro_use]
+mod macros;
 
 mod executor;
 mod functions;
@@ -60,20 +63,16 @@ pub fn query(py: Python<'_>, query: &str, data: Option<PyObject>) -> PyResult<Py
         };
     }
 
-    let stream = execute_plan(py, &plan.logical_plan, &mut ctx)?;
-
-    stream
-        .map(|row| {
-            row.map(|p| {
-                p.into_values()
-                    .flat_map(|v| v.into_iter())
-                    .collect::<Vec<_>>()
-                    .into_py_dict_bound(py)
-                    .unbind()
-            })
+    let result = execute_plan(py, &plan.logical_plan, &mut ctx)?
+        .map_ok(|row| {
+            row.into_values()
+                .flat_map(|v| v.into_iter())
+                .into_py_dict_bound(py)
+                .unbind()
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|x| x.into_py(py))
+        .collect::<PyResult<Vec<_>>>()?;
+
+    Ok(result.into_py(py))
 }
 
 #[pyfunction]
@@ -141,10 +140,7 @@ fn try_extract_variables_from_scope(
         } else if let Ok(Some(value)) = globals.get_item(_name) {
             value
         } else {
-            return Err(PyNameError::new_err(format!(
-                "variable `{}` is not defined",
-                _name
-            )));
+            return Err(NameError!("variable `{}` is not defined", _name));
         };
 
         if value.is_callable() {

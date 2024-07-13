@@ -67,7 +67,7 @@ assert result == [
 - [ ] `ORDER BY`
     - [x] `ASC`, `DESC`
     - [ ] `NULLS FIRST`, `NULLS LAST`
-- [ ] `LIMIT`
+- [x] `LIMIT`
 - [ ] `OFFSET`
 - [x] `INNER JOIN`
 - [ ] `LEFT JOIN`
@@ -98,10 +98,10 @@ assert result == [
 - [ ] Query Parameters, e.g. `SELECT * FROM table WHERE date > $1`
 - [x] Nested data structures
 - [ ] Prepared queries
-- [ ] UDF
+- [x] UDF
 
 
-# Related work
+# Similar projects
 
 - [pythonql](https://github.com/pythonql/pythonql)
 - [sqlglot query engine](https://github.com/tobymao/sqlglot#sql-execution)

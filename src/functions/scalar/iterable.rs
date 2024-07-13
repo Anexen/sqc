@@ -1,28 +1,14 @@
-use pyo3::{exceptions::PyTypeError, prelude::*};
+use pyo3::prelude::*;
 
-use super::{ScalarFunctionImpl, Volatility};
+#[pyfunction]
+#[pyo3(name = "empty", signature = (iterable, /))]
+pub fn empty(iterable: &Bound<'_, PyAny>) -> PyResult<bool> {
+    iterable.len().map(|l| l == 0)
+}
 
-#[derive(Debug)]
-pub struct Length;
-
-impl ScalarFunctionImpl for Length {
-    fn names(&self) -> Vec<&'static str> {
-        vec!["length", "len"]
-    }
-
-    fn volatility(&self) -> Volatility {
-        Volatility::Immutable
-    }
-
-    fn invoke(&self, py: Python<'_>, args: &[PyObject]) -> PyResult<PyObject> {
-        if args.len() != 1 {
-            return Err(PyTypeError::new_err("expected 0 arguments, got 1"));
-        };
-
-        if args[0].is_none(py) {
-            return Ok(py.None());
-        }
-
-        args[0].call_method0(py, "__len__")
-    }
+#[pyfunction]
+pub fn index_of(iterable: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    Ok(iterable
+        .iter()?
+        .position(|item| item.and_then(|x| x.eq(value)).unwrap_or(false)))
 }

@@ -1,86 +1,25 @@
-use pyo3::{
-    prelude::*,
-    types::{PyList, PyString, PyTuple},
-    PyTypeInfo,
-};
+use pyo3::{intern, prelude::*, types::*};
 
-use super::{ScalarFunctionImpl, Volatility};
-
-#[derive(Debug)]
-pub struct Lowercase;
-
-impl ScalarFunctionImpl for Lowercase {
-    fn names(&self) -> Vec<&'static str> {
-        vec!["lowercase", "lower"]
-    }
-
-    fn volatility(&self) -> Volatility {
-        Volatility::Immutable
-    }
-
-    fn invoke(&self, py: Python<'_>, args: &[PyObject]) -> PyResult<PyObject> {
-        call_string_method(py, "lower", args)
-    }
+#[pyfunction]
+pub fn lower<'p>(py: Python<'p>, value: &Bound<'p, PyString>) -> PyResult<Bound<'p, PyAny>> {
+    value.call_method0(intern!(py, "lower"))
 }
 
-#[derive(Debug)]
-pub struct Uppercase;
-
-impl ScalarFunctionImpl for Uppercase {
-    fn names(&self) -> Vec<&'static str> {
-        vec!["uppercase", "upper"]
-    }
-
-    fn volatility(&self) -> Volatility {
-        Volatility::Immutable
-    }
-
-    fn invoke(&self, py: Python<'_>, args: &[PyObject]) -> PyResult<PyObject> {
-        call_string_method(py, "upper", args)
-    }
+#[pyfunction]
+pub fn upper<'p>(py: Python<'p>, value: &Bound<'p, PyString>) -> PyResult<Bound<'p, PyAny>> {
+    value.call_method0(intern!(py, "upper"))
 }
 
-#[derive(Debug)]
-pub struct Repeat;
-
-impl ScalarFunctionImpl for Repeat {
-    fn names(&self) -> Vec<&'static str> {
-        vec!["repeat"]
-    }
-
-    fn volatility(&self) -> Volatility {
-        Volatility::Immutable
-    }
-
-    fn invoke(&self, py: Python<'_>, args: &[PyObject]) -> PyResult<PyObject> {
-        call_string_method(py, "__mul__", args)
-    }
+#[pyfunction]
+pub fn repeat<'p>(
+    value: &Bound<'p, PyString>,
+    n: &Bound<'p, PyLong>,
+) -> PyResult<Bound<'p, PyAny>> {
+    value.mul(n)
 }
 
-#[derive(Debug)]
-pub struct Concat;
-
-impl ScalarFunctionImpl for Concat {
-    fn names(&self) -> Vec<&'static str> {
-        vec!["concat"]
-    }
-
-    fn volatility(&self) -> Volatility {
-        Volatility::Immutable
-    }
-
-    fn invoke(&self, py: Python<'_>, args: &[PyObject]) -> PyResult<PyObject> {
-        let args = PyList::new_bound(py, args);
-        PyString::new_bound(py, "")
-            .call_method1("join", (args,))
-            .map(|v| v.unbind())
-    }
-}
-
-fn call_string_method(py: Python, method: &str, args: &[PyObject]) -> PyResult<PyObject> {
-    let args = PyTuple::new_bound(py, args);
-
-    PyString::type_object_bound(py)
-        .call_method1(method, args)
-        .map(|v| v.unbind())
+#[pyfunction]
+#[pyo3(signature = (*args))]
+pub fn concat<'p>(py: Python<'p>, args: &Bound<'p, PyAny>) -> PyResult<Bound<'p, PyAny>> {
+    intern!(py, "").call_method1(intern!(py, "join"), (args,))
 }
