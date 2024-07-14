@@ -6,7 +6,7 @@ use std::{
 
 use ambassador::delegatable_trait;
 use itertools::Itertools;
-use pyo3::{prelude::*, types::*};
+use pyo3::{intern, prelude::*, types::*};
 
 use crate::{
     functions::scalar::{ScalarUDF, Volatility},
@@ -61,7 +61,8 @@ impl ExecutionContext {
             .ok_or_else(|| NameError!("table `{}` is not defined", table_name))?;
 
         let stream = inner.bind(py).iter()?.map_then(|obj| {
-            obj.extract::<IndexMap<Identifier, PyObject>>()
+            obj.downcast_into::<PyDict>()
+                .map_err(PyErr::from)
                 .map(|row| IndexMap::from_iter([(table_name.clone(), row)]))
         });
 
@@ -93,7 +94,7 @@ pub trait ExecExpr<'p> {
         py: ::pyo3::Python<'p>,
         ctx: &'p crate::executor::ExecutionContext,
         row: &'p crate::stream::Row,
-    ) -> pyo3::PyResult<pyo3::PyObject>;
+    ) -> pyo3::PyResult<pyo3::Bound<'p, pyo3::types::PyAny>>;
 }
 
 impl<'p> Exec<'p> for Projection {
@@ -104,7 +105,7 @@ impl<'p> Exec<'p> for Projection {
             let data = self
                 .expr
                 .iter()
-                .map(|(name, expr)| -> PyResult<Vec<(Identifier, PyObject)>> {
+                .map(|(name, expr)| -> PyResult<Vec<(_, _)>> {
                     match expr {
                         Expr::Wildcard(wildcard) => match wildcard.table.as_ref() {
                             Some(table_ref) => {
@@ -114,23 +115,27 @@ impl<'p> Exec<'p> for Projection {
 
                                 Ok(part
                                     .into_iter()
-                                    .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+                                    .map(|(k, v)| (k.clone(), v.clone()))
                                     .collect_vec())
                             }
                             None => Ok(row
                                 .values()
-                                .flat_map(|x| {
-                                    x.into_iter().map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                                })
+                                .flat_map(|x| x.into_iter().map(|(k, v)| (k.clone(), v.clone())))
                                 .collect_vec()),
                         },
-                        _ => Ok(vec![(name.clone(), expr.execute(py, ctx, &row)?)]),
+                        _ => Ok(vec![(
+                            PyString::new_bound(py, &name.0).into_any(),
+                            expr.execute(py, ctx, &row)?,
+                        )]),
                     }
                 })
                 .flatten_ok();
 
-            let part: IndexMap<_, _> = data.try_collect()?;
-            Ok(IndexMap::from_iter([(table_ref.clone(), part)]))
+            let part: Vec<_> = data.try_collect()?;
+            Ok(IndexMap::from_iter([(
+                table_ref.clone(),
+                part.into_py_dict_bound(py),
+            )]))
         });
 
         Ok(Stream::new(data))
@@ -158,28 +163,29 @@ impl<'p> Exec<'p> for Sort {
 
         let mut indices: Vec<_> = input
             .iter()
-            .map(|row| -> PyResult<Vec<PyObject>> {
+            .map(|row| -> PyResult<Vec<_>> {
                 self.expr
                     .iter()
-                    .map(|e| e.expr.execute(py, ctx, row))
+                    .map(|e| e.expr.execute(py, ctx, row).map(|v| v.unbind()))
                     .try_collect()
             })
             .enumerate()
-            .map(|(i, v)| v.map(move |k| (k, i)))
+            .map(|(i, v)| v.map(|k| (k, i)))
             .try_collect()?;
 
         indices.sort_by(|(a, _), (b, _)| {
-            a.iter().zip(b.iter()).enumerate().fold(
-                std::cmp::Ordering::Equal,
-                |acc, (i, (a, b))| {
-                    let ordering = acc.then(a.bind(py).compare(b.bind(py)).unwrap());
+            a.iter()
+                .map(|a| a.bind(py))
+                .zip(b.iter().map(|b| b.bind(py)))
+                .enumerate()
+                .fold(std::cmp::Ordering::Equal, |acc, (i, (a, b))| {
+                    let ordering = acc.then(a.compare(&b).unwrap());
                     if self.expr[i].asc {
                         ordering
                     } else {
                         ordering.reverse()
                     }
-                },
-            )
+                })
         });
 
         for i in 0..input.len() {
@@ -215,7 +221,7 @@ impl<'p> Exec<'p> for Join {
             })
             .try_collect()?;
 
-        let stream = left.into_iter().filter_map_ok(move |x| {
+        let stream = left.into_iter().filter_map_then(move |x| {
             let join_keys = self
                 .on
                 .iter()
@@ -223,24 +229,36 @@ impl<'p> Exec<'p> for Join {
                 .collect_vec();
 
             let value = PyTuple::new_bound(py, join_keys);
-            let key = value.hash().unwrap();
+            let key = value.hash()?;
 
             let mut result: Row = IndexMap::default();
 
-            for (table_ref, data) in hash_table.get(&key)? {
-                result
+            let row = match hash_table.get(&key) {
+                Some(row) => row,
+                None => return Ok(None),
+            };
+
+            for (table_ref, data) in row {
+                let t = result
                     .entry(table_ref.clone())
-                    .or_insert(IndexMap::default())
-                    .extend(data.iter().map(|(k, v)| (k.clone(), v.clone_ref(py))));
+                    .or_insert(PyDict::new_bound(py));
+
+                for (k, v) in data.iter() {
+                    t.set_item(k, v)?;
+                }
             }
 
             for (table_ref, data) in x.into_iter() {
-                result
-                    .entry(table_ref)
-                    .or_insert(IndexMap::default())
-                    .extend(data);
+                let t = result
+                    .entry(table_ref.clone())
+                    .or_insert(PyDict::new_bound(py));
+
+                for (k, v) in data.iter() {
+                    t.set_item(k, v)?;
+                }
             }
-            Some(result)
+
+            Ok(Some(result))
         });
 
         Ok(Stream::new(stream))
@@ -269,9 +287,9 @@ impl<'p> Exec<'p> for Filter {
 }
 
 impl<'p> Exec<'p> for EmptyRelation {
-    fn execute(&'p self, _py: Python<'p>, _ctx: &'p ExecutionContext) -> PyResult<Stream<'p>> {
+    fn execute(&'p self, py: Python<'p>, _ctx: &'p ExecutionContext) -> PyResult<Stream<'p>> {
         let table_ref = TableReference::default();
-        let row = IndexMap::from_iter([(table_ref, Default::default())]);
+        let row = IndexMap::from_iter([(table_ref, PyDict::new_bound(py))]);
         let data = vec![Ok(row)];
         Ok(Stream::new(data))
     }
@@ -282,7 +300,7 @@ impl<'p> Exec<'p> for Limit {
         let limit = self
             .limit
             .execute(py, ctx, &Default::default())?
-            .extract::<usize>(py)?;
+            .extract::<usize>()?;
 
         let offset = self
             .offset
@@ -290,7 +308,7 @@ impl<'p> Exec<'p> for Limit {
             .map(|offset| {
                 offset
                     .execute(py, ctx, &Default::default())?
-                    .extract::<usize>(py)
+                    .extract::<usize>()
             })
             .transpose()?
             .unwrap_or(0);
@@ -307,9 +325,7 @@ fn evaluate_predicate(
     predicate: &Expr,
     row: &Row,
 ) -> PyResult<bool> {
-    predicate
-        .execute(py, ctx, row)
-        .and_then(|x| x.is_truthy(py))
+    predicate.execute(py, ctx, row).and_then(|x| x.is_truthy())
 }
 
 impl<'p> ExecExpr<'p> for Wildcard {
@@ -318,7 +334,7 @@ impl<'p> ExecExpr<'p> for Wildcard {
         _py: Python<'p>,
         _ctx: &'p ExecutionContext,
         _row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         unreachable!();
     }
 }
@@ -329,7 +345,7 @@ impl<'p> ExecExpr<'p> for Alias {
         _py: Python<'p>,
         _ctx: &'p ExecutionContext,
         _row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         unreachable!();
     }
 }
@@ -339,28 +355,33 @@ impl<'p> ExecExpr<'p> for Column {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         if self.name.0.starts_with('@') {
             return ctx
                 .tables
                 .get(self.name.0.as_ref())
-                .map(|v| v.clone_ref(py))
+                .map(|v| v.clone_ref(py).into_bound(py))
                 .ok_or_else(|| NameError!("variable `{}` is not defined", self.name));
         }
 
         let table_ref = match self.relation.as_ref() {
             Some(t) => t,
             None => {
-                let candidates = row
-                    .iter()
-                    .filter_map(|(k, v)| v.contains_key(&self.name).then_some(k))
-                    .take(2)
-                    .collect_vec();
+                if row.len() == 1 {
+                    row.keys().next().unwrap()
+                } else {
+                    let name = PyString::new_bound(py, &self.name.0);
+                    let candidates = row
+                        .iter()
+                        .filter_map(|(k, v)| v.contains(&name).unwrap().then_some(k))
+                        .take(2)
+                        .collect_vec();
 
-                match candidates.len() {
-                    0 => return Err(NameError!("column `{}` is not defined", self.name)),
-                    1 => candidates[0],
-                    _ => return Err(NameError!("column `{}` is ambiguous", self.name)),
+                    match candidates.len() {
+                        0 => return Err(NameError!("column `{}` is not defined", self.name)),
+                        1 => candidates[0],
+                        _ => return Err(NameError!("column `{}` is ambiguous", self.name)),
+                    }
                 }
             }
         };
@@ -368,9 +389,9 @@ impl<'p> ExecExpr<'p> for Column {
             .get(table_ref)
             .ok_or_else(|| NameError!("table `{}` is not defined", table_ref))?;
 
-        let result = match part.get(&self.name) {
-            Some(x) => x.into_py(py),
-            None => return Ok(py.None()),
+        let result = match part.get_item(&self.name)? {
+            Some(x) => x,
+            None => return Ok(py.None().into_bound(py)),
         };
 
         Ok(result.into())
@@ -383,8 +404,8 @@ impl<'p> ExecExpr<'p> for Rc<PyObject> {
         py: Python<'p>,
         _ctx: &'p ExecutionContext,
         _row: &'p Row,
-    ) -> PyResult<PyObject> {
-        Ok(self.clone_ref(py))
+    ) -> PyResult<Bound<'p, PyAny>> {
+        Ok(self.bind(py).clone())
     }
 }
 
@@ -394,17 +415,19 @@ impl<'p> ExecExpr<'p> for UnaryExpr {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         let value = self.expr.execute(py, ctx, row)?;
 
-        if value.is_none(py) {
+        if value.is_none() {
             return Ok(value);
         }
 
         let result = match self.op {
-            Operator::Plus => value.call_method0(py, "__pos__")?,
-            Operator::Minus => value.call_method0(py, "__neg__")?,
-            Operator::Not => (!value.is_truthy(py)?).into_py(py),
+            Operator::Plus => value.call_method0(intern!(py, "__pos__"))?,
+            Operator::Minus => value.call_method0(intern!(py, "__neg__"))?,
+            Operator::Not => PyBool::new_bound(py, !value.is_truthy()?)
+                .to_owned()
+                .into_any(),
             _ => unreachable!(),
         };
 
@@ -417,43 +440,43 @@ impl<'p> ExecExpr<'p> for BinaryExpr {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         let left = self.left.execute(py, ctx, row)?;
         let right = self.right.execute(py, ctx, row)?;
 
-        if !matches!(self.op, Operator::Is | Operator::IsNot)
-            && (left.is_none(py) | right.is_none(py))
+        if !matches!(self.op, Operator::Is | Operator::IsNot) && (left.is_none() | right.is_none())
         {
-            return Ok(py.None());
+            return Ok(PyNone::get_bound(py).to_owned().into_any());
         };
 
-        let left = left.bind(py);
-        let right = right.bind(py);
-
         let result = match self.op {
-            Operator::Plus => left.add(right)?.into_py(py),
-            Operator::Minus => left.sub(right)?.into_py(py),
-            Operator::Multiply => left.mul(right)?.into_py(py),
-            Operator::Divide => left.div(right)?.into_py(py),
-            Operator::IntegerDivide => left.call_method1("__floordiv__", (right,))?.into_py(py),
-            Operator::Modulo => left.call_method1("__mod__", (right,))?.into_py(py),
-            Operator::Eq => left.eq(right)?.into_py(py),
-            Operator::Gt => left.gt(right)?.into_py(py),
-            Operator::GtEq => left.ge(right)?.into_py(py),
-            Operator::Lt => left.lt(right)?.into_py(py),
-            Operator::LtEq => left.le(right)?.into_py(py),
-            Operator::And => (left.is_truthy()? && right.is_truthy()?).into_py(py),
-            Operator::Or => (left.is_truthy()? || right.is_truthy()?).into_py(py),
+            Operator::Plus => left.add(right)?,
+            Operator::Minus => left.sub(right)?,
+            Operator::Multiply => left.mul(right)?,
+            Operator::Divide => left.div(right)?,
+            Operator::IntegerDivide => left.call_method1(intern!(py, "__floordiv__"), (right,))?,
+            Operator::Modulo => left.call_method1(intern!(py, "__mod__"), (right,))?,
+            Operator::Eq => left.eq(right)?.into_py(py).into_bound(py),
+            Operator::Gt => left.gt(right)?.into_py(py).into_bound(py),
+            Operator::GtEq => left.ge(right)?.into_py(py).into_bound(py),
+            Operator::Lt => left.lt(right)?.into_py(py).into_bound(py),
+            Operator::LtEq => left.le(right)?.into_py(py).into_bound(py),
+            Operator::And => (left.is_truthy()? && right.is_truthy()?)
+                .into_py(py)
+                .into_bound(py),
+            Operator::Or => (left.is_truthy()? || right.is_truthy()?)
+                .into_py(py)
+                .into_bound(py),
             Operator::Not => unreachable!(),
             // Operator::Arrow => match left.get_item(right) {
             //     Ok(x) => x.into_py(py),
             //     Err(_) => return Ok(py.None()),
             // },
             Operator::Arrow => todo!(),
-            Operator::Is => left.is(right).into_py(py),
-            Operator::IsNot => (!left.is(right)).into_py(py),
-            Operator::BitAnd => left.bitand(right)?.into_py(py),
-            Operator::BitOr => left.bitor(right)?.into_py(py),
+            Operator::Is => left.is(&right).into_py(py).into_bound(py),
+            Operator::IsNot => (!left.is(&right)).into_py(py).into_bound(py),
+            Operator::BitAnd => left.bitand(right)?,
+            Operator::BitOr => left.bitor(right)?,
         };
 
         Ok(result.into())
@@ -466,7 +489,7 @@ impl<'p> ExecExpr<'p> for ScalarFunction {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         let f_impl = ctx
             .scalar_functions
             .get(&self.name)
@@ -474,9 +497,12 @@ impl<'p> ExecExpr<'p> for ScalarFunction {
 
         if f_impl.volatility == Volatility::Stable {
             return match ctx.result_cache.borrow_mut().entry(f_impl.name.clone()) {
-                std::collections::hash_map::Entry::Occupied(e) => Ok(e.get().clone_ref(py)),
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    Ok(e.get().clone_ref(py).into_bound(py))
+                }
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    Ok(e.insert(f_impl.inner.call0(py)?).clone_ref(py))
+                    let v = e.insert(f_impl.inner.call0(py)?);
+                    Ok(v.clone_ref(py).into_bound(py))
                 }
             };
         };
@@ -493,8 +519,7 @@ impl<'p> ExecExpr<'p> for ScalarFunction {
             .map(|(k, v)| -> PyResult<_> { Ok((k.clone(), v.execute(py, ctx, row)?)) })
             .try_collect()?;
 
-        f_impl.inner.call_bound(
-            py,
+        f_impl.inner.bind(py).call(
             PyTuple::new_bound(py, args),
             Some(&kwargs.into_py_dict_bound(py)),
         )
@@ -507,7 +532,7 @@ impl<'p> ExecExpr<'p> for MethodCall {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         let args: Vec<_> = self
             .args
             .iter()
@@ -517,7 +542,6 @@ impl<'p> ExecExpr<'p> for MethodCall {
         let input = self.input.execute(py, ctx, row)?;
 
         input.call_method1(
-            py,
             PyString::new_bound(py, self.name.0.as_ref()),
             PyTuple::new_bound(py, args),
         )
@@ -530,14 +554,14 @@ impl<'p> ExecExpr<'p> for Tuple {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         let args: Vec<_> = self
             .elements
             .iter()
             .map(|expr| expr.execute(py, ctx, row))
             .try_collect()?;
 
-        Ok(PyTuple::new_bound(py, args).unbind().into())
+        Ok(PyTuple::new_bound(py, args).into_any())
     }
 }
 
@@ -547,14 +571,14 @@ impl<'p> ExecExpr<'p> for List {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         let args: Vec<_> = self
             .elements
             .iter()
             .map(|expr| expr.execute(py, ctx, row))
             .try_collect()?;
 
-        Ok(PyList::new_bound(py, args).unbind().into())
+        Ok(PyList::new_bound(py, args).into_any())
     }
 }
 
@@ -564,7 +588,7 @@ impl<'p> ExecExpr<'p> for Dict {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'p, PyAny>> {
         let items: Vec<_> = self
             .items
             .iter()
@@ -573,7 +597,7 @@ impl<'p> ExecExpr<'p> for Dict {
             })
             .try_collect()?;
 
-        Ok(items.into_py_dict_bound(py).unbind().into())
+        Ok(items.into_py_dict_bound(py).into_any())
     }
 }
 
@@ -583,8 +607,8 @@ impl<'p> ExecExpr<'p> for GetItem {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
-        let mut input = self.input.execute(py, ctx, row)?.into_bound(py);
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let mut input = self.input.execute(py, ctx, row)?;
         for key in self.keys.iter() {
             if input.is_none() {
                 break;
@@ -596,7 +620,7 @@ impl<'p> ExecExpr<'p> for GetItem {
             }
         }
 
-        Ok(input.unbind())
+        Ok(input)
     }
 }
 
@@ -606,22 +630,23 @@ impl<'p> ExecExpr<'p> for GetAttr {
         py: Python<'p>,
         ctx: &'p ExecutionContext,
         row: &'p Row,
-    ) -> PyResult<PyObject> {
-        let mut input = self.input.execute(py, ctx, row)?.into_bound(py);
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let mut input = self.input.execute(py, ctx, row)?;
+        if input.is_none() {
+            return Ok(py.None().into_bound(py));
+        }
+
         for key in self.keys.iter() {
-            if input.is_none() {
-                break;
-            }
             let key = key.execute(py, ctx, row)?;
-            let key = key.downcast_bound::<PyString>(py).map_err(PyErr::from)?;
+            let key = key.downcast::<PyString>().map_err(PyErr::from)?;
 
             if let Ok(item) = input.getattr(key) {
                 input = item
             } else {
-                input = py.None().into_bound(py);
+                return Ok(py.None().into_bound(py));
             }
         }
 
-        Ok(input.unbind())
+        Ok(input)
     }
 }

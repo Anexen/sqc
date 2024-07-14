@@ -32,6 +32,7 @@ pub fn sqc(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(query, m)?)?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
+    m.add_function(wrap_pyfunction!(prepare, m)?)?;
     Ok(())
 }
 
@@ -42,7 +43,50 @@ pub fn query(py: Python<'_>, query: &str, data: Option<PyObject>) -> PyResult<Py
     let plan = planner::prepare_plan(&ast)?;
 
     // let plan = Optimizer::default().optimize(plan.logical_plan);
+    execute(py, &plan, data)
+}
 
+#[pyclass]
+#[pyo3(unsendable)]
+pub struct PreparedQuery {
+    plan: planner::PreparedPlan,
+}
+
+#[pymethods]
+impl PreparedQuery {
+    #[pyo3(signature = (data=None))]
+    fn execute(&self, py: Python<'_>, data: Option<PyObject>) -> PyResult<PyObject> {
+        execute(py, &self.plan, data)
+    }
+}
+
+#[pyfunction]
+pub fn prepare(query: &str) -> PyResult<PreparedQuery> {
+    let ast = parser::parse_query(query)?;
+    Ok(PreparedQuery {
+        plan: planner::prepare_plan(&ast)?,
+    })
+}
+
+#[pyfunction]
+pub fn parse(query: &str) -> PyResult<String> {
+    let ast = parser::parse_query(query)?;
+    Ok(format!("{ast:#?}"))
+}
+
+// #[pyfunction(name = "explain")]
+// pub fn explain_(query: &str) -> PyResult<String> {
+//     let ast = parser::parse_query(query)?;
+//     let plan = planner::prepare_plan(&ast)?;
+//     let result = explain::explain(&plan);
+//     Ok(result.to_string())
+// }
+
+fn execute(
+    py: Python<'_>,
+    plan: &planner::PreparedPlan,
+    data: Option<PyObject>,
+) -> PyResult<PyObject> {
     let mut ctx = ExecutionContext::new();
 
     if !plan.external_names.is_empty() {
@@ -65,29 +109,18 @@ pub fn query(py: Python<'_>, query: &str, data: Option<PyObject>) -> PyResult<Py
 
     let result = execute_plan(py, &plan.logical_plan, &mut ctx)?
         .map_ok(|row| {
-            row.into_values()
-                .flat_map(|v| v.into_iter())
-                .into_py_dict_bound(py)
-                .unbind()
+            if row.len() == 1 {
+                row.into_values().next().unwrap()
+            } else {
+                row.into_values()
+                    .flat_map(|v| v.into_iter())
+                    .into_py_dict_bound(py)
+            }
         })
         .collect::<PyResult<Vec<_>>>()?;
 
     Ok(result.into_py(py))
 }
-
-#[pyfunction]
-pub fn parse(query: &str) -> PyResult<String> {
-    let ast = parser::parse_query(query)?;
-    Ok(format!("{ast:#?}"))
-}
-
-// #[pyfunction(name = "explain")]
-// pub fn explain_(query: &str) -> PyResult<String> {
-//     let ast = parser::parse_query(query)?;
-//     let plan = planner::prepare_plan(&ast)?;
-//     let result = explain::explain(&plan);
-//     Ok(result.to_string())
-// }
 
 #[derive(Debug, Display, Error, From)]
 pub enum SqcError {
