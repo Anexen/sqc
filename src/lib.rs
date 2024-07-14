@@ -1,4 +1,3 @@
-use derive_more::{Display, Error, From};
 use itertools::Itertools;
 // use optimizer::Optimizer;
 use pyo3::{
@@ -22,17 +21,32 @@ pub use executor::{execute_plan, ExecutionContext};
 pub use parser::parse_query;
 pub use planner::prepare_plan;
 
-create_exception!("sqc", PySqcError, pyo3::exceptions::PyException);
-create_exception!("sqc", PyParserError, PySqcError);
+create_exception!("sqc", SqcError, pyo3::exceptions::PyBaseException);
+create_exception!("sqc", ParserError, SqcError);
+create_exception!("sqc", PlannerError, SqcError);
+
+impl From<parser::ParserError> for PyErr {
+    fn from(value: parser::ParserError) -> Self {
+        ParserError::new_err(value.to_string())
+    }
+}
+
+impl From<planner::PlannerError> for PyErr {
+    fn from(value: planner::PlannerError) -> Self {
+        PlannerError::new_err(value.to_string())
+    }
+}
 
 #[pymodule]
 pub fn sqc(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("SqcError", py.get_type_bound::<PySqcError>())?;
-    m.add("ParserError", py.get_type_bound::<PyParserError>())?;
+    m.add("SqcError", py.get_type_bound::<SqcError>())?;
+    m.add("ParserError", py.get_type_bound::<ParserError>())?;
+    m.add("PlanError", py.get_type_bound::<PlannerError>())?;
 
     m.add_function(wrap_pyfunction!(query, m)?)?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(prepare, m)?)?;
+    m.add_function(wrap_pyfunction!(explain_, m)?)?;
     Ok(())
 }
 
@@ -74,13 +88,13 @@ pub fn parse(query: &str) -> PyResult<String> {
     Ok(format!("{ast:#?}"))
 }
 
-// #[pyfunction(name = "explain")]
-// pub fn explain_(query: &str) -> PyResult<String> {
-//     let ast = parser::parse_query(query)?;
-//     let plan = planner::prepare_plan(&ast)?;
-//     let result = explain::explain(&plan);
-//     Ok(result.to_string())
-// }
+#[pyfunction(name = "explain")]
+pub fn explain_(query: &str) -> PyResult<String> {
+    let ast = parser::parse_query(query)?;
+    let plan = planner::prepare_plan(&ast)?;
+    // let result = explain::explain(&plan);
+    Ok(format!("{:#?}", plan.logical_plan))
+}
 
 fn execute(
     py: Python<'_>,
@@ -107,7 +121,7 @@ fn execute(
         };
     }
 
-    let result = execute_plan(py, &plan.logical_plan, &mut ctx)?
+    let result: Vec<_> = execute_plan(py, &plan.logical_plan, &mut ctx)?
         .map_ok(|row| {
             if row.len() == 1 {
                 row.into_values().next().unwrap()
@@ -117,39 +131,9 @@ fn execute(
                     .into_py_dict_bound(py)
             }
         })
-        .collect::<PyResult<Vec<_>>>()?;
+        .try_collect()?;
 
     Ok(result.into_py(py))
-}
-
-#[derive(Debug, Display, Error, From)]
-pub enum SqcError {
-    #[display(fmt = "query parsing error")]
-    ParserError(parser::QueryParserError),
-    #[display(fmt = "query planning error")]
-    PlannerError(logical_plan::PlanError),
-    #[display(fmt = "table not found: {_0}")]
-    TableNotFound(#[error(not(source))] String),
-    #[display(fmt = "Runtime Error")]
-    RuntimeError(PyErr),
-}
-
-impl From<parser::QueryParserError> for PyErr {
-    fn from(value: parser::QueryParserError) -> Self {
-        PyParserError::new_err(value.to_string())
-    }
-}
-
-impl From<logical_plan::PlanError> for PyErr {
-    fn from(value: logical_plan::PlanError) -> Self {
-        PySqcError::new_err(value.to_string())
-    }
-}
-
-impl From<SqcError> for PyErr {
-    fn from(value: SqcError) -> Self {
-        PySqcError::new_err(value.to_string())
-    }
 }
 
 fn try_extract_variables_from_scope(

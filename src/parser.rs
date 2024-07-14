@@ -1,24 +1,37 @@
 use derive_more::{Display, Error, From};
+
 use sqlparser::{
     ast::{self, Query, Statement},
     dialect::Dialect,
     keywords::Keyword,
-    parser::{Parser, ParserError, ParserOptions},
+    parser::{Parser, ParserError as SqlParserError, ParserOptions},
     tokenizer::Token,
 };
 
+type ParseResult<T> = Result<T, SqlParserError>;
+
 #[derive(Debug, Error, Display, From)]
-pub enum QueryParserError {
+pub enum ParserError {
+    #[display(fmt = "empty query")]
     EmptyQuery,
-    #[display(fmt = "Unsupported query: {_0}")]
-    UnsupportedQuery(#[error(not(source))] String),
-    MultipleQueries,
-    #[display(fmt = "Query parsing error: {_0}")]
-    InvalidQuery(ParserError),
+    #[display(fmt = "unsupported statement")]
+    UnsupportedStatement,
+    #[display(fmt = "multiple statements are not supported")]
+    MultipleStatements,
+    #[display(fmt = "{}", "display_sql_parser_error({_0})")]
+    InvalidQuery(#[error(source)] SqlParserError),
 }
 
-pub fn parse_query(query: &str) -> Result<Query, QueryParserError> {
-    let dialect = PythonDialect::default();
+fn display_sql_parser_error(error: &SqlParserError) -> &str {
+    match error {
+        SqlParserError::TokenizerError(s) => s,
+        SqlParserError::ParserError(s) => s,
+        SqlParserError::RecursionLimitExceeded => "recursion limit",
+    }
+}
+
+pub fn parse_query(query: &str) -> Result<Query, ParserError> {
+    let dialect = PythonDialect;
 
     let options = ParserOptions::new()
         .with_trailing_commas(true)
@@ -30,12 +43,12 @@ pub fn parse_query(query: &str) -> Result<Query, QueryParserError> {
         .parse_statements()?;
 
     match statements.len() {
-        0 => Err(QueryParserError::EmptyQuery),
+        0 => Err(ParserError::EmptyQuery),
         1 => match statements.into_iter().next().unwrap() {
             Statement::Query(query) => Ok(*query),
-            stmt => Err(QueryParserError::UnsupportedQuery(stmt.to_string())),
+            _ => Err(ParserError::UnsupportedStatement),
         },
-        _ => Err(QueryParserError::MultipleQueries),
+        _ => Err(ParserError::MultipleStatements),
     }
 }
 
@@ -83,7 +96,7 @@ impl Dialect for PythonDialect {
         false // TODO
     }
 
-    fn get_next_precedence(&self, parser: &Parser) -> Option<Result<u8, ParserError>> {
+    fn get_next_precedence(&self, parser: &Parser) -> Option<ParseResult<u8>> {
         match parser.peek_token().token {
             Token::Arrow => Some(Ok(100)),
             _ => None,
@@ -95,14 +108,11 @@ impl Dialect for PythonDialect {
         parser: &mut Parser,
         expr: &ast::Expr,
         precedence: u8,
-    ) -> Option<Result<ast::Expr, ParserError>> {
+    ) -> Option<ParseResult<ast::Expr>> {
         let steps_back = match parser.next_token().token {
             Token::Mul => match parser.next_token().token {
                 Token::Mul => return Some(parse_power_operator(parser, expr, precedence)),
-                w => {
-                    println!("W: {}, NEXT: {}", w, parser.peek_token());
-                    2
-                }
+                _ => 2,
             },
             // handle integer division
             Token::Div => match parser.next_token().token {
@@ -127,7 +137,7 @@ impl Dialect for PythonDialect {
         None
     }
 
-    fn parse_prefix(&self, parser: &mut Parser) -> Option<Result<ast::Expr, ParserError>> {
+    fn parse_prefix(&self, parser: &mut Parser) -> Option<ParseResult<ast::Expr>> {
         let steps_back = match parser.next_token().token {
             Token::Word(w) if w.keyword == Keyword::NONE => {
                 return Some(Ok(ast::Expr::Value(ast::Value::Null)));
@@ -155,7 +165,7 @@ fn parse_power_operator(
     parser: &mut Parser,
     expr: &ast::Expr,
     precedence: u8,
-) -> Result<ast::Expr, ParserError> {
+) -> ParseResult<ast::Expr> {
     // replace ** operator with pow function
     let exponent = parser.parse_subexpr(precedence)?;
     Ok(function_call("pow", [expr.clone(), exponent]))
@@ -165,7 +175,7 @@ fn parse_integer_divide(
     parser: &mut Parser,
     expr: &ast::Expr,
     precedence: u8,
-) -> Result<ast::Expr, ParserError> {
+) -> ParseResult<ast::Expr> {
     let right = parser.parse_subexpr(precedence)?;
     Ok(ast::Expr::BinaryOp {
         left: Box::new(expr.clone()),
@@ -178,7 +188,7 @@ fn parse_identity_operator(
     parser: &mut Parser,
     expr: &ast::Expr,
     precedence: u8,
-) -> Result<ast::Expr, ParserError> {
+) -> ParseResult<ast::Expr> {
     if parser.parse_keyword(Keyword::NOT) {
         let right = parser.parse_subexpr(precedence)?;
         Ok(ast::Expr::IsDistinctFrom(
@@ -194,7 +204,7 @@ fn parse_identity_operator(
     }
 }
 
-fn parse_dictionary_literal(parser: &mut Parser) -> Result<ast::Expr, ParserError> {
+fn parse_dictionary_literal(parser: &mut Parser) -> ParseResult<ast::Expr> {
     parser.expect_token(&Token::LBrace)?;
 
     let elements = if parser.peek_token().token == Token::RBrace {
@@ -214,14 +224,14 @@ fn parse_dictionary_literal(parser: &mut Parser) -> Result<ast::Expr, ParserErro
     Ok(function_call("dict", [fields]))
 }
 
-fn parse_dictionary_field(parser: &mut Parser) -> Result<ast::Expr, ParserError> {
+fn parse_dictionary_field(parser: &mut Parser) -> ParseResult<ast::Expr> {
     let key = parser.parse_expr()?;
     parser.expect_token(&Token::Colon)?;
     let value = parser.parse_expr()?;
     Ok(ast::Expr::Tuple(vec![key, value]))
 }
 
-fn parse_maybe_tuple_literal(parser: &mut Parser) -> Result<ast::Expr, ParserError> {
+fn parse_maybe_tuple_literal(parser: &mut Parser) -> ParseResult<ast::Expr> {
     // (1) -> is not tuple
     // (1,) -> is tuple
 

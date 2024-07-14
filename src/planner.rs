@@ -1,6 +1,7 @@
-use itertools::Itertools;
 use std::{any::Any, rc::Rc};
 
+use derive_more::{Display, Error, From};
+use itertools::Itertools;
 use pyo3::{
     prelude::*,
     types::{PyFloat, PyLong},
@@ -11,10 +12,15 @@ use sqlparser::ast;
 use crate::logical_plan::*;
 use crate::stream::IndexMap;
 
-type PlanResult<T = LogicalPlan> = Result<T, PlanError>;
+type PlanResult<T = LogicalPlan> = Result<T, PlannerError>;
 type EquijoinPredicate = (Expr, Expr);
 
-pub fn prepare_plan(query: &ast::Query) -> Result<PreparedPlan, PlanError> {
+#[derive(Debug, Error, Display, From)]
+pub enum PlannerError {
+    NotImplemented(#[error(not(source))] String),
+}
+
+pub fn prepare_plan(query: &ast::Query) -> PlanResult<PreparedPlan> {
     let mut visitor = Visitor::default();
     let result = visitor.visit_query(query)?;
 
@@ -45,12 +51,11 @@ impl Visitor {
                 .map(|offset| self.visit_expr(&offset.value))
                 .transpose()?;
 
-            result = LimitBuilder::default()
-                .input(result.into())
-                .limit(self.visit_expr(limit)?)
-                .offset(offset)
-                .build()?
-                .into();
+            result = LogicalPlan::Limit(Limit {
+                input: Rc::new(result),
+                limit: self.visit_expr(limit)?,
+                offset,
+            })
         }
 
         Ok(result)
@@ -67,11 +72,10 @@ impl Visitor {
     fn visit_select(&mut self, select: &ast::Select, order_by: &[ast::OrderByExpr]) -> PlanResult {
         let mut result = self.visit_from(&select.from)?;
         if let Some(predicate) = &select.selection {
-            result = FilterBuilder::default()
-                .predicate(self.visit_expr(predicate)?)
-                .input(result)
-                .build()?
-                .into();
+            result = LogicalPlan::Filter(Filter {
+                predicate: self.visit_expr(predicate)?,
+                input: Rc::new(result),
+            });
         }
 
         if !order_by.is_empty() {
@@ -80,26 +84,26 @@ impl Visitor {
                 .map(|o| self.visit_order_by_expr(o))
                 .try_collect()?;
 
-            result = SortBuilder::default()
-                .expr(sort_expr)
-                .input(result)
-                .build()?
-                .into();
+            result = LogicalPlan::Sort(Sort {
+                expr: sort_expr,
+                input: Rc::new(result),
+            });
         }
 
         let projection = self.visit_projection(&select.projection)?;
-        result = ProjectionBuilder::default()
-            .expr(projection)
-            .input(result)
-            .build()?
-            .into();
+        result = LogicalPlan::Projection(Projection {
+            expr: projection,
+            input: Rc::new(result),
+        });
 
         Ok(result)
     }
 
     fn visit_from(&mut self, from: &[ast::TableWithJoins]) -> PlanResult {
         if from.is_empty() {
-            return Ok(EmptyRelationBuilder::default().build()?.into());
+            return Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: true,
+            }));
         };
 
         let scans = from
@@ -108,7 +112,7 @@ impl Visitor {
             .collect::<PlanResult<Vec<_>>>()?;
 
         if scans.len() > 1 {
-            todo!("cross_join")
+            return Err(PlannerError::NotImplemented("cross join".to_string()));
         }
 
         Ok(scans.into_iter().next().unwrap())
@@ -121,12 +125,12 @@ impl Visitor {
             return Ok(result);
         }
 
-        let mut table_refs = vec![self.get_table_ref(&result)?];
+        let mut table_refs = vec![get_table_ref(&result)?];
         let joins = table.joins.iter();
 
         for join in joins {
-            let join_node = self.visit_join(&result, join, &mut table_refs)?;
-            table_refs.push(self.get_table_ref(&join_node.right)?);
+            let join_node = self.visit_join(&result, join, &table_refs)?;
+            table_refs.push(get_table_ref(&join_node.right)?);
             result = join_node.into();
         }
 
@@ -155,7 +159,7 @@ impl Visitor {
         left_refs: &[TableReference],
     ) -> PlanResult<Join> {
         let right = self.visit_table_factor(&join.relation)?;
-        let right_refs = &[self.get_table_ref(&right)?];
+        let right_refs = &[get_table_ref(&right)?];
 
         let on_expr;
         let filter_expr;
@@ -174,13 +178,13 @@ impl Visitor {
             _ => todo!("{join}"),
         };
 
-        JoinBuilder::default()
-            .left(left.clone())
-            .right(right)
-            .join_type(join_type)
-            .on(on_expr)
-            .filter(filter_expr)
-            .build()
+        Ok(Join {
+            left: Rc::new(left.clone()),
+            right: Rc::new(right),
+            join_type,
+            on: on_expr,
+            filter: filter_expr,
+        })
     }
 
     fn visit_join_constraint(
@@ -192,7 +196,7 @@ impl Visitor {
         match join_constraint {
             ast::JoinConstraint::On(expr) => {
                 let expr = self.visit_expr(expr)?;
-                self.split_eq_and_noneq_join_predicate(&expr, left_refs, right_refs)
+                split_eq_and_noneq_join_predicate(&expr, left_refs, right_refs)
             }
             _ => unimplemented!("{join_constraint:?}"),
         }
@@ -206,17 +210,18 @@ impl Visitor {
                     self.external_names.push(name.clone());
                 }
 
-                let mut result = TableScanBuilder::default()
-                    .table_name(TableReference(name.into()))
-                    .build()?
-                    .into();
+                let mut result = LogicalPlan::TableScan(TableScan {
+                    table_name: TableReference(name.into()),
+                    projection: None,
+                    filters: Vec::new(),
+                    fetch: None,
+                });
 
                 if let Some(alias) = alias {
-                    result = SubqueryAliasBuilder::default()
-                        .alias(TableReference(alias.to_string().into()))
-                        .input(result)
-                        .build()?
-                        .into();
+                    result = LogicalPlan::SubqueryAlias(SubqueryAlias {
+                        alias: TableReference(alias.to_string().into()),
+                        input: Rc::new(result),
+                    });
                 }
 
                 Ok(result)
@@ -242,12 +247,12 @@ impl Visitor {
                         Ok((alias.value.clone().into(), self.visit_expr(expr)?))
                     }
                     SelectItem::Wildcard(_) => {
-                        let result = WildcardBuilder::default().build()?.into();
+                        let result = Expr::Wildcard(Wildcard { table: None });
                         Ok(("*".to_string().into(), result))
                     }
                     SelectItem::QualifiedWildcard(object_name, _) => {
-                        let table_ref = TableReference(object_name.to_string().into());
-                        let result = WildcardBuilder::default().table(table_ref).build()?.into();
+                        let table = TableReference(object_name.to_string().into());
+                        let result = Expr::Wildcard(Wildcard { table: Some(table) });
                         Ok((object_name.to_string().into(), result))
                     }
                 }
@@ -262,70 +267,59 @@ impl Visitor {
                     self.external_names.push(ident.value.clone())
                 }
 
-                ColumnBuilder::default()
-                    .name(ident.value.clone())
-                    .build()?
-                    .into()
+                Expr::Column(Column {
+                    name: Identifier::new(ident.value.clone()),
+                    relation: None,
+                })
             }
-            ast::Expr::CompoundIdentifier(ident) => ColumnBuilder::default()
-                .name(ident[ident.len() - 1].value.clone())
-                .relation(if !ident.is_empty() {
+            ast::Expr::CompoundIdentifier(ident) => Expr::Column(Column {
+                name: Identifier::new(ident[ident.len() - 1].value.clone()),
+                relation: if !ident.is_empty() {
                     Some(TableReference(ident[0].value.clone().into()))
                 } else {
                     None
-                })
-                .build()?
-                .into(),
+                },
+            }),
             ast::Expr::Nested(nested) => self.visit_expr(nested)?,
-            ast::Expr::UnaryOp { op, expr } => UnaryExprBuilder::default()
-                .op(self.visit_unary_op(op)?)
-                .expr(self.visit_expr(expr)?)
-                .build()?
-                .into(),
+            ast::Expr::UnaryOp { op, expr } => Expr::Unary(UnaryExpr {
+                op: self.visit_unary_op(op)?,
+                expr: Box::new(self.visit_expr(expr)?),
+            }),
             ast::Expr::BinaryOp { left, op, right } => {
                 let left = self.visit_expr(left)?;
                 let op = self.visit_binary_op(op)?;
                 let right = self.visit_expr(right)?;
 
                 match (left, op, right) {
-                    (left, Operator::Arrow, Expr::Column(c)) => GetAttrBuilder::default()
-                        .input(left)
-                        .keys(vec![self.make_literal(c.name.to_string())])
-                        .build()?
-                        .into(),
+                    (left, Operator::Arrow, Expr::Column(c)) => Expr::GetAttr(GetAttr {
+                        input: Box::new(left),
+                        keys: vec![make_literal(c.name.to_string())],
+                    }),
                     (left, Operator::Arrow, Expr::ScalarFunction(f)) => {
-                        MethodCallBuilder::default()
-                            .input(left)
-                            .name(f.name)
-                            .args(f.args)
-                            .build()?
-                            .into()
+                        Expr::MethodCall(MethodCall {
+                            input: Box::new(left),
+                            name: f.name,
+                            args: f.args,
+                        })
                     }
-                    (left, op, right) => BinaryExprBuilder::default()
-                        .left(left)
-                        .op(op)
-                        .right(right)
-                        .build()?
-                        .into(),
+                    (left, op, right) => left.binary_expr(right, op),
                 }
             }
             ast::Expr::Value(value) => self.visit_value(value)?,
-            ast::Expr::Named { expr, name } => AliasBuilder::default()
-                .expr(self.visit_expr(expr)?)
-                .name(name.value.clone())
-                .build()?
-                .into(),
+            ast::Expr::Named { expr, name } => Expr::Alias(Alias {
+                name: name.value.clone(),
+                expr: Box::new(self.visit_expr(expr)?),
+            }),
             ast::Expr::Subscript { expr, subscript } => {
                 let right = match subscript.as_ref() {
                     ast::Subscript::Index { index } => index,
                     _ => unimplemented!("{expr:?}"),
                 };
 
-                GetItemBuilder::default()
-                    .input(self.visit_expr(expr)?)
-                    .keys(vec![self.visit_expr(right)?])
-                    .build()?
-                    .into()
+                Expr::GetItem(GetItem {
+                    input: Box::new(self.visit_expr(expr)?),
+                    keys: vec![self.visit_expr(right)?],
+                })
             }
             ast::Expr::Function(function) => {
                 let name = function.name.to_string();
@@ -333,59 +327,46 @@ impl Visitor {
                     self.external_names.push(name.clone())
                 }
                 let (args, kwargs) = self.visit_function_arguments(&function.args)?;
-                ScalarFunctionBuilder::default()
-                    .name(name)
-                    .args(args)
-                    .kwargs(kwargs)
-                    .build()?
-                    .into()
+                Expr::ScalarFunction(ScalarFunction {
+                    name: Identifier::new(name),
+                    args,
+                    kwargs,
+                })
             }
-            ast::Expr::IsDistinctFrom(left, right) => BinaryExprBuilder::default()
-                .left(self.visit_expr(left)?)
-                .op(Operator::IsNot)
-                .right(self.visit_expr(right)?)
-                .build()?
-                .into(),
-            ast::Expr::IsNotDistinctFrom(left, right) => BinaryExprBuilder::default()
-                .left(self.visit_expr(left)?)
-                .op(Operator::Is)
-                .right(self.visit_expr(right)?)
-                .build()?
-                .into(),
-            ast::Expr::Tuple(elements) => TupleBuilder::default()
-                .elements(elements.iter().map(|x| self.visit_expr(x)).try_collect()?)
-                .build()?
-                .into(),
-            ast::Expr::Array(array) => ListBuilder::default()
-                .elements(
-                    array
-                        .elem
-                        .iter()
-                        .map(|x| self.visit_expr(x))
-                        .try_collect()?,
-                )
-                .build()?
-                .into(),
-            ast::Expr::Dictionary(items) => DictBuilder::default()
-                .items(
-                    items
-                        .iter()
-                        .map(|x| -> PlanResult<_> {
-                            let key = Python::with_gil(|py| {
-                                Expr::Literal(Rc::new(x.key.value.clone().into_py(py)))
-                            });
-                            let value = self.visit_expr(&x.value)?;
-                            Ok((key, value))
-                        })
-                        .try_collect()?,
-                )
-                .build()?
-                .into(),
-            ast::Expr::MapAccess { column, keys } => GetItemBuilder::default()
-                .input(self.visit_expr(column)?)
-                .keys(keys.iter().map(|k| self.visit_expr(&k.key)).try_collect()?)
-                .build()?
-                .into(),
+            ast::Expr::IsDistinctFrom(left, right) => Expr::Binary(BinaryExpr {
+                left: Box::new(self.visit_expr(left)?),
+                op: Operator::IsNot,
+                right: Box::new(self.visit_expr(right)?),
+            }),
+            ast::Expr::IsNotDistinctFrom(left, right) => Expr::Binary(BinaryExpr {
+                left: Box::new(self.visit_expr(left)?),
+                op: Operator::Is,
+                right: Box::new(self.visit_expr(right)?),
+            }),
+            ast::Expr::Tuple(elements) => Expr::Tuple(Tuple {
+                elements: elements.iter().map(|x| self.visit_expr(x)).try_collect()?,
+            }),
+            ast::Expr::Array(array) => Expr::List(List {
+                elements: array
+                    .elem
+                    .iter()
+                    .map(|x| self.visit_expr(x))
+                    .try_collect()?,
+            }),
+            ast::Expr::Dictionary(items) => Expr::Dict(Dict {
+                items: items
+                    .iter()
+                    .map(|x| -> PlanResult<_> {
+                        let key = make_literal(x.key.value.clone());
+                        let value = self.visit_expr(&x.value)?;
+                        Ok((key, value))
+                    })
+                    .try_collect()?,
+            }),
+            ast::Expr::MapAccess { column, keys } => Expr::GetItem(GetItem {
+                input: Box::new(self.visit_expr(column)?),
+                keys: keys.iter().map(|k| self.visit_expr(&k.key)).try_collect()?,
+            }),
             _ => unimplemented!("{expr:?}"),
         };
         Ok(result)
@@ -481,91 +462,89 @@ impl Visitor {
             _ => unimplemented!("{value}"),
         });
 
-        Ok(Expr::Literal(Rc::new(value)))
+        Ok(make_literal(value))
     }
+}
 
-    fn get_table_ref(&mut self, plan: &LogicalPlan) -> PlanResult<TableReference> {
-        let table_ref = match plan {
-            LogicalPlan::TableScan(v) => v.table_name.clone(),
-            LogicalPlan::SubqueryAlias(v) => v.alias.clone(),
-            LogicalPlan::Projection(v) => self.get_table_ref(&v.input)?,
-            LogicalPlan::Filter(v) => self.get_table_ref(&v.input)?,
-            LogicalPlan::EmptyRelation(_) => unreachable!(),
-            LogicalPlan::Join(_) => unreachable!(),
-            LogicalPlan::Sort(v) => self.get_table_ref(&v.input)?,
-            LogicalPlan::Limit(v) => self.get_table_ref(&v.input)?,
-        };
-        Ok(table_ref)
-    }
+fn get_table_ref(plan: &LogicalPlan) -> PlanResult<TableReference> {
+    let table_ref = match plan {
+        LogicalPlan::TableScan(v) => v.table_name.clone(),
+        LogicalPlan::SubqueryAlias(v) => v.alias.clone(),
+        LogicalPlan::Projection(v) => get_table_ref(&v.input)?,
+        LogicalPlan::Filter(v) => get_table_ref(&v.input)?,
+        LogicalPlan::EmptyRelation(_) => unreachable!(),
+        LogicalPlan::Join(_) => unreachable!(),
+        LogicalPlan::Sort(v) => get_table_ref(&v.input)?,
+        LogicalPlan::Limit(v) => get_table_ref(&v.input)?,
+    };
+    Ok(table_ref)
+}
 
-    fn make_literal<T: IntoPy<PyObject>>(&self, value: T) -> Expr {
-        let value = Python::with_gil(|py| value.into_py(py));
-        Expr::Literal(Rc::new(value))
-    }
+fn make_literal<T: IntoPy<PyObject>>(value: T) -> Expr {
+    let value = Python::with_gil(|py| value.into_py(py));
+    Expr::Literal(Rc::new(value))
+}
 
-    fn split_eq_and_noneq_join_predicate(
-        &mut self,
-        filter: &Expr,
-        left_refs: &[TableReference],
-        right_refs: &[TableReference],
-    ) -> PlanResult<(Vec<EquijoinPredicate>, Option<Expr>)> {
-        let exprs = filter.split_binary_expression(Operator::And);
+fn split_eq_and_noneq_join_predicate(
+    filter: &Expr,
+    left_refs: &[TableReference],
+    right_refs: &[TableReference],
+) -> PlanResult<(Vec<EquijoinPredicate>, Option<Expr>)> {
+    let exprs = filter.split_binary_expression(Operator::And);
 
-        let mut join_keys: Vec<(Expr, Expr)> = vec![];
-        // Conditions like a = 10, will be added to non-equijoin.
-        let mut filters: Vec<Expr> = vec![];
+    let mut join_keys: Vec<(Expr, Expr)> = vec![];
+    // Conditions like a = 10, will be added to non-equijoin.
+    let mut filters: Vec<Expr> = vec![];
 
-        for expr in exprs {
-            match expr {
-                Expr::BinaryExpr(ref binary_expr) if binary_expr.op == Operator::Eq => {
-                    let join_key_pair = self.find_valid_equijoin_key_pair(
-                        &binary_expr.left,
-                        &binary_expr.right,
-                        left_refs,
-                        right_refs,
-                    );
+    for expr in exprs {
+        match expr {
+            Expr::Binary(ref binary_expr) if binary_expr.op == Operator::Eq => {
+                let join_key_pair = find_valid_equijoin_key_pair(
+                    &binary_expr.left,
+                    &binary_expr.right,
+                    left_refs,
+                    right_refs,
+                );
 
-                    if let Some((left_expr, right_expr)) = join_key_pair {
-                        join_keys.push((left_expr, right_expr));
-                    } else {
-                        filters.push(expr);
-                    }
+                if let Some((left_expr, right_expr)) = join_key_pair {
+                    join_keys.push((left_expr, right_expr));
+                } else {
+                    filters.push(expr);
                 }
-                _ => filters.push(expr),
             }
-        }
-
-        let filter_expr = filters.into_iter().reduce(Expr::and);
-        Ok((join_keys, filter_expr))
-    }
-
-    fn find_valid_equijoin_key_pair(
-        &mut self,
-        left: &Expr,
-        right: &Expr,
-        left_refs: &[TableReference],
-        right_refs: &[TableReference],
-    ) -> Option<EquijoinPredicate> {
-        if self.check_all_columns_from_relation(left, left_refs)
-            && self.check_all_columns_from_relation(right, right_refs)
-        {
-            Some((left.clone(), right.clone()))
-        } else if self.check_all_columns_from_relation(left, right_refs)
-            && self.check_all_columns_from_relation(right, left_refs)
-        {
-            Some((right.clone(), left.clone()))
-        } else {
-            None
+            _ => filters.push(expr),
         }
     }
 
-    fn check_all_columns_from_relation(&mut self, expr: &Expr, tables: &[TableReference]) -> bool {
-        let columns = expr.extract_columns();
-        columns
-            .iter()
-            .filter_map(|c| c.relation.as_ref())
-            .all(|r| tables.contains(r))
+    let filter_expr = filters.into_iter().reduce(Expr::and);
+    Ok((join_keys, filter_expr))
+}
+
+fn find_valid_equijoin_key_pair(
+    left: &Expr,
+    right: &Expr,
+    left_refs: &[TableReference],
+    right_refs: &[TableReference],
+) -> Option<EquijoinPredicate> {
+    if check_all_columns_from_relation(left, left_refs)
+        && check_all_columns_from_relation(right, right_refs)
+    {
+        Some((left.clone(), right.clone()))
+    } else if check_all_columns_from_relation(left, right_refs)
+        && check_all_columns_from_relation(right, left_refs)
+    {
+        Some((right.clone(), left.clone()))
+    } else {
+        None
     }
+}
+
+fn check_all_columns_from_relation(expr: &Expr, tables: &[TableReference]) -> bool {
+    let columns = expr.extract_columns();
+    columns
+        .iter()
+        .filter_map(|c| c.relation.as_ref())
+        .all(|r| tables.contains(r))
 }
 
 // pub fn try_unzip<I, C, T, E>(iter: I) -> Result<C, E>

@@ -1,25 +1,12 @@
-use ambassador::Delegate;
-use derive_builder::{Builder, UninitializedFieldError};
-use derive_more::{Display, Error, From};
+use derive_more::{Display, From};
 use itertools::Itertools;
 use pyo3::{FromPyObject, PyObject};
 use std::fmt;
 use std::rc::Rc;
 
-use crate::executor::{ambassador_impl_Exec, ambassador_impl_ExecExpr, Exec, ExecExpr};
 use crate::stream::IndexMap;
 
-#[derive(Debug, Error, Display)]
-#[display(fmt = "{_0}")]
-pub struct PlanError(#[error(not(source))] String);
-
-impl From<UninitializedFieldError> for PlanError {
-    fn from(e: UninitializedFieldError) -> Self {
-        PlanError(e.to_string())
-    }
-}
-
-#[derive(Clone, Display, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Display, Eq, Hash, PartialEq)]
 #[display(fmt = "{_0}")]
 pub struct Identifier(pub Rc<String>);
 
@@ -60,9 +47,7 @@ impl From<String> for Identifier {
 //     }
 // }
 
-#[derive(Clone, From, Delegate)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[delegate(Exec<'p>, generics = "'p")]
+#[derive(Debug, Clone, From)]
 pub enum LogicalPlan {
     Projection(Projection),
     TableScan(TableScan),
@@ -74,26 +59,20 @@ pub enum LogicalPlan {
     Limit(Limit),
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+#[derive(Debug, Clone)]
 pub struct Limit {
     pub limit: Expr,
     pub offset: Option<Expr>,
     pub input: Rc<LogicalPlan>,
 }
 
-#[derive(Clone, From, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+#[derive(Debug, Clone, From)]
 pub struct Sort {
     pub expr: Vec<OrderByExpr>,
-    #[builder(setter(into))]
     pub input: Rc<LogicalPlan>,
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(Debug, Clone)]
 pub struct OrderByExpr {
     pub expr: Expr,
     pub asc: bool,
@@ -127,99 +106,73 @@ impl Default for TableReference {
     }
 }
 
-#[derive(Clone, Display, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+#[derive(Debug, Clone, Display)]
 #[display(
     fmt = "{name}",
     // r#"match relation { Some(v) => format!("{v}.{name}"), None => name.to_string() }"#
 )]
 pub struct Column {
-    #[builder(setter(into))]
     pub name: Identifier,
-    #[builder(default)]
     pub relation: Option<TableReference>,
 }
 
-#[derive(Clone, Display, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(Debug, Clone, Display)]
 #[display(fmt = "{expr} AS {name}")]
-#[builder(build_fn(error = "PlanError"), setter(into))]
 pub struct Alias {
     pub expr: Box<Expr>,
     // pub relation: Option<TableReference>,
     pub name: String,
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"), setter(into))]
+#[derive(Debug, Clone)]
 pub struct SubqueryAlias {
     pub alias: TableReference,
     pub input: Rc<LogicalPlan>,
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"), setter(into))]
+#[derive(Debug, Clone)]
 pub struct Projection {
     pub expr: IndexMap<Identifier, Expr>,
     pub input: Rc<LogicalPlan>,
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+#[derive(Debug, Clone)]
 pub struct EmptyRelation {
-    #[builder(default = "true")]
     pub produce_one_row: bool,
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+#[derive(Debug, Clone)]
 pub struct TableScan {
     pub table_name: TableReference,
-    #[builder(default)]
     pub projection: Option<Vec<usize>>,
-    #[builder(default)]
     pub filters: Vec<Expr>,
-    #[builder(default)]
     pub fetch: Option<usize>,
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"), setter(into))]
+#[derive(Debug, Clone)]
 pub struct Filter {
     pub predicate: Expr,
     pub input: Rc<LogicalPlan>,
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"), setter(into))]
+#[derive(Debug, Clone)]
 pub struct Join {
     pub left: Rc<LogicalPlan>,
     pub right: Rc<LogicalPlan>,
     pub join_type: JoinType,
     /// equi conditions
-    #[builder(default)]
     pub on: Vec<(Expr, Expr)>,
     /// non-equi conditions
-    #[builder(default)]
     pub filter: Option<Expr>,
 }
 
-#[derive(Clone, From, Display, Delegate)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[delegate(ExecExpr<'p>, generics = "'p")]
+#[derive(Debug, Clone, From, Display)]
 pub enum Expr {
     Column(Column),
     Alias(Alias),
     Literal(Rc<PyObject>),
-    UnaryExpr(UnaryExpr),
-    BinaryExpr(BinaryExpr),
+    Unary(UnaryExpr),
+    Binary(BinaryExpr),
     ScalarFunction(ScalarFunction),
     Wildcard(Wildcard),
     Tuple(Tuple),
@@ -230,126 +183,79 @@ pub enum Expr {
     MethodCall(MethodCall),
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+fn display_comma_separated_expr(exprs: &[Expr]) -> String {
+    exprs.iter().map(ToString::to_string).join(", ")
+}
+
+#[derive(Debug, Clone, Display)]
+#[display(fmt = "({})", "display_comma_separated_expr(&self.elements)")]
 pub struct Tuple {
     pub elements: Vec<Expr>,
 }
 
-impl fmt::Display for Tuple {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "({})",
-            self.elements.iter().map(|e| e.to_string()).join(", ")
-        )
-    }
-}
-
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+#[derive(Debug, Clone, Display)]
+#[display(fmt = "[{}]", "display_comma_separated_expr(&self.elements)")]
 pub struct List {
     pub elements: Vec<Expr>,
 }
 
-impl fmt::Display for List {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "[{}]",
-            self.elements.iter().map(|e| e.to_string()).join(", ")
-        )
-    }
-}
-
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+#[derive(Debug, Clone)]
 pub struct Dict {
     pub items: Vec<(Expr, Expr)>,
 }
 
 impl fmt::Display for Dict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{{{}}}",
-            self.items
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
-                .join(", ")
-        )
+        let items = self
+            .items
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .join(", ");
+
+        write!(f, "{{{items}}}")
     }
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+#[derive(Debug, Clone)]
 pub struct GetItem {
-    #[builder(setter(into))]
     pub input: Box<Expr>,
     pub keys: Vec<Expr>,
 }
 
 impl fmt::Display for GetItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}{}",
-            self.input,
-            self.keys
-                .iter()
-                .map(|e| format!("[{}]", e.to_string()))
-                .join("")
-        )
+        let keys = self.keys.iter().map(|e| format!("[{e}]")).join("");
+        write!(f, "{}{}", self.input, keys)
     }
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"))]
+#[derive(Debug, Clone)]
 pub struct GetAttr {
-    #[builder(setter(into))]
     pub input: Box<Expr>,
     pub keys: Vec<Expr>,
 }
 
 impl fmt::Display for GetAttr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}.{}",
-            self.input,
-            self.keys.iter().map(|e| e.to_string()).join(".")
-        )
+        let keys = self.keys.iter().map(|e| e.to_string()).join(".");
+        write!(f, "{}.{}", self.input, keys)
     }
 }
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"), setter(into))]
+#[derive(Debug, Clone)]
 pub struct ScalarFunction {
     pub name: Identifier,
     pub args: Vec<Expr>,
-    #[builder(default)]
     pub kwargs: IndexMap<Identifier, Expr>,
 }
 
 impl fmt::Display for ScalarFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}({})",
-            self.name,
-            self.args.iter().map(|e| e.to_string()).join(", ")
-        )
+        let args = self.args.iter().map(|e| e.to_string()).join(", ");
+        write!(f, "{}({})", self.name, args)
     }
 }
 
-#[derive(Clone, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"), setter(into))]
+#[derive(Debug, Clone)]
 pub struct MethodCall {
     pub input: Box<Expr>,
     pub name: Identifier,
@@ -358,19 +264,12 @@ pub struct MethodCall {
 
 impl fmt::Display for MethodCall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}.{}({})",
-            self.input,
-            self.name,
-            self.args.iter().map(|e| e.to_string()).join(", ")
-        )
+        let args = self.args.iter().map(|e| e.to_string()).join(", ");
+        write!(f, "{}.{}({})", self.input, self.name, args)
     }
 }
 
-#[derive(Clone, Display, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"), setter(into))]
+#[derive(Debug, Clone, Display)]
 #[display(fmt = "({left} {op} {right})")]
 pub struct BinaryExpr {
     pub left: Box<Expr>,
@@ -378,71 +277,29 @@ pub struct BinaryExpr {
     pub right: Box<Expr>,
 }
 
-impl BinaryExpr {
-    pub fn is_strict_equality(&self) -> bool {
-        match self.op {
-            Operator::Eq => true,
-            Operator::And => {
-                let left = match self.left.as_ref() {
-                    Expr::BinaryExpr(e) => e.is_strict_equality(),
-                    _ => false,
-                };
-                let right = match self.left.as_ref() {
-                    Expr::BinaryExpr(e) => e.is_strict_equality(),
-                    _ => false,
-                };
-                left && right
-            }
-            _ => false,
-        }
-    }
-
-    pub fn try_decompose_into(&self, out: &mut Vec<(Expr, Expr)>) -> Result<(), PlanError> {
-        match self.op {
-            Operator::Eq => {
-                out.push((*self.left.clone(), *self.right.clone()));
-            }
-            Operator::And => {
-                match self.left.as_ref() {
-                    Expr::BinaryExpr(e) => e.try_decompose_into(out),
-                    _ => Err(PlanError("".to_string())),
-                }?;
-
-                match self.right.as_ref() {
-                    Expr::BinaryExpr(e) => e.try_decompose_into(out),
-                    _ => Err(PlanError("".to_string())),
-                }?;
-            }
-            _ => return Err(PlanError("".to_string())),
-        };
-        Ok(())
-    }
-}
-
-#[derive(Clone, Display, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"), setter(into))]
+#[derive(Debug, Clone, Display)]
 #[display(fmt = "{op} {expr}")]
 pub struct UnaryExpr {
     pub op: Operator,
     pub expr: Box<Expr>,
 }
 
-#[derive(Clone, Display, Builder)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[builder(build_fn(error = "PlanError"), setter(into))]
-#[display(
-    fmt = "{}",
-    r#"match table { Some(v) => format!("{v}.*"), None => "*".to_string() }"#
-)]
+#[derive(Debug, Clone)]
 pub struct Wildcard {
-    #[builder(default)]
     pub table: Option<TableReference>,
     // TODO: * EXCEPT (name)
 }
 
-#[derive(Clone, PartialEq, Eq, Display)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+impl fmt::Display for Wildcard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.table.as_ref() {
+            Some(v) => write!(f, "{v}.*"),
+            None => write!(f, "*"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Display)]
 pub enum Operator {
     #[display(fmt = "+")]
     Plus,
@@ -484,8 +341,7 @@ pub enum Operator {
     BitOr,
 }
 
-#[derive(Clone, Display)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(Debug, Clone, Display)]
 pub enum JoinType {
     Inner,
     Left,
@@ -499,13 +355,11 @@ impl Expr {
     }
 
     pub fn binary_expr(self, right: Expr, op: Operator) -> Expr {
-        BinaryExprBuilder::default()
-            .left(self)
-            .op(op)
-            .right(right)
-            .build()
-            .unwrap()
-            .into()
+        Expr::Binary(BinaryExpr {
+            left: Box::new(self),
+            op,
+            right: Box::new(right),
+        })
     }
 
     pub fn extract_columns(&self) -> Vec<&Column> {
@@ -519,8 +373,8 @@ impl Expr {
             Expr::Column(column) => columns.push(column),
             Expr::Alias(alias) => alias.expr.extract_columns_impl(columns),
             Expr::Literal(_) => {}
-            Expr::UnaryExpr(unary_expr) => unary_expr.expr.extract_columns_impl(columns),
-            Expr::BinaryExpr(binary_expr) => {
+            Expr::Unary(unary_expr) => unary_expr.expr.extract_columns_impl(columns),
+            Expr::Binary(binary_expr) => {
                 binary_expr.right.extract_columns_impl(columns);
                 binary_expr.left.extract_columns_impl(columns);
             }
@@ -554,7 +408,7 @@ impl Expr {
 
     fn split_binary_expression_impl(&self, op: &Operator, exprs: &mut Vec<Expr>) {
         match self {
-            Expr::BinaryExpr(binary_expr) if &binary_expr.op == op => {
+            Expr::Binary(binary_expr) if &binary_expr.op == op => {
                 binary_expr.left.split_binary_expression_impl(op, exprs);
                 binary_expr.right.split_binary_expression_impl(op, exprs);
             }

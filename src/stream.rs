@@ -56,12 +56,12 @@ pub trait ResultIterator<R, E>: Iterator<Item = Result<R, E>> {
         FilterMapThen { iter: self, f }
     }
 
-    fn and_all<F>(mut self, mut f: F) -> Result<bool, E>
+    fn and_all<F>(self, mut f: F) -> Result<bool, E>
     where
         Self: Sized,
         F: FnMut(&R) -> Result<bool, E>,
     {
-        while let Some(item) = self.next() {
+        for item in self {
             match item {
                 Err(e) => return Err(e),
                 Ok(x) => match f(&x) {
@@ -110,7 +110,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let f = &mut self.f;
-        while let Some(item) = self.iter.next() {
+        for item in self.iter.by_ref() {
             match item {
                 Err(e) => return Some(Err(e)),
                 Ok(x) => match f(&x) {
@@ -140,7 +140,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         let f = &mut self.f;
 
-        while let Some(item) = self.iter.next() {
+        for item in self.iter.by_ref() {
             match item {
                 Err(e) => return Some(Err(e)),
                 Ok(x) => match f(&x) {

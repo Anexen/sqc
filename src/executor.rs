@@ -1,17 +1,20 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::{hash_map::Entry, BTreeMap, HashMap},
     rc::Rc,
 };
 
-use ambassador::delegatable_trait;
 use itertools::Itertools;
-use pyo3::{intern, prelude::*, types::*};
+use pyo3::{
+    intern,
+    prelude::*,
+    types::{PyAny, *},
+};
 
 use crate::{
     functions::scalar::{ScalarUDF, Volatility},
     logical_plan::*,
-    stream::{IndexMap, *},
+    stream::{IndexMap, Row, Stream, *},
 };
 
 pub struct ExecutionContext {
@@ -78,23 +81,58 @@ pub fn execute_plan<'p>(
     plan.execute(py, ctx)
 }
 
-#[delegatable_trait]
 pub trait Exec<'p> {
-    fn execute(
-        &'p self,
-        py: ::pyo3::Python<'p>,
-        ctx: &'p crate::executor::ExecutionContext,
-    ) -> ::pyo3::PyResult<crate::stream::Stream<'p>>;
+    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext)
+        -> ::pyo3::PyResult<Stream<'p>>;
 }
 
-#[delegatable_trait]
+impl<'p> Exec<'p> for LogicalPlan {
+    fn execute(&'p self, py: Python<'p>, ctx: &'p ExecutionContext) -> Result<Stream<'p>, PyErr> {
+        match self {
+            LogicalPlan::Projection(v) => v.execute(py, ctx),
+            LogicalPlan::TableScan(v) => v.execute(py, ctx),
+            LogicalPlan::SubqueryAlias(v) => v.execute(py, ctx),
+            LogicalPlan::Filter(v) => v.execute(py, ctx),
+            LogicalPlan::EmptyRelation(v) => v.execute(py, ctx),
+            LogicalPlan::Join(v) => v.execute(py, ctx),
+            LogicalPlan::Sort(v) => v.execute(py, ctx),
+            LogicalPlan::Limit(v) => v.execute(py, ctx),
+        }
+    }
+}
+
 pub trait ExecExpr<'p> {
     fn execute(
         &'p self,
-        py: ::pyo3::Python<'p>,
-        ctx: &'p crate::executor::ExecutionContext,
-        row: &'p crate::stream::Row,
-    ) -> pyo3::PyResult<pyo3::Bound<'p, pyo3::types::PyAny>>;
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> Result<Bound<'p, PyAny>, PyErr>;
+}
+
+impl<'p> ExecExpr<'p> for Expr {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> Result<Bound<'p, PyAny>, PyErr> {
+        match self {
+            Expr::Column(v) => v.execute(py, ctx, row),
+            Expr::Alias(v) => v.execute(py, ctx, row),
+            Expr::Literal(v) => v.execute(py, ctx, row),
+            Expr::Unary(v) => v.execute(py, ctx, row),
+            Expr::Binary(v) => v.execute(py, ctx, row),
+            Expr::ScalarFunction(v) => v.execute(py, ctx, row),
+            Expr::Wildcard(v) => v.execute(py, ctx, row),
+            Expr::Tuple(v) => v.execute(py, ctx, row),
+            Expr::List(v) => v.execute(py, ctx, row),
+            Expr::Dict(v) => v.execute(py, ctx, row),
+            Expr::GetItem(v) => v.execute(py, ctx, row),
+            Expr::GetAttr(v) => v.execute(py, ctx, row),
+            Expr::MethodCall(v) => v.execute(py, ctx, row),
+        }
+    }
 }
 
 impl<'p> Exec<'p> for Projection {
@@ -179,7 +217,7 @@ impl<'p> Exec<'p> for Sort {
                 .zip(b.iter().map(|b| b.bind(py)))
                 .enumerate()
                 .fold(std::cmp::Ordering::Equal, |acc, (i, (a, b))| {
-                    let ordering = acc.then(a.compare(&b).unwrap());
+                    let ordering = acc.then(a.compare(b).unwrap());
                     if self.expr[i].asc {
                         ordering
                     } else {
@@ -225,7 +263,7 @@ impl<'p> Exec<'p> for Join {
             let join_keys = self
                 .on
                 .iter()
-                .filter_map(|(left_expr, _)| left_expr.execute(py, ctx, &x).ok())
+                .filter_map(|(left_expr, _)| left_expr.execute(py, ctx, x).ok())
                 .collect_vec();
 
             let value = PyTuple::new_bound(py, join_keys);
@@ -389,12 +427,10 @@ impl<'p> ExecExpr<'p> for Column {
             .get(table_ref)
             .ok_or_else(|| NameError!("table `{}` is not defined", table_ref))?;
 
-        let result = match part.get_item(&self.name)? {
-            Some(x) => x,
-            None => return Ok(py.None().into_bound(py)),
-        };
-
-        Ok(result.into())
+        match part.get_item(&self.name)? {
+            Some(x) => Ok(x),
+            None => Ok(py.None().into_bound(py)),
+        }
     }
 }
 
@@ -431,7 +467,7 @@ impl<'p> ExecExpr<'p> for UnaryExpr {
             _ => unreachable!(),
         };
 
-        Ok(result.into())
+        Ok(result)
     }
 }
 impl<'p> ExecExpr<'p> for BinaryExpr {
@@ -479,7 +515,7 @@ impl<'p> ExecExpr<'p> for BinaryExpr {
             Operator::BitOr => left.bitor(right)?,
         };
 
-        Ok(result.into())
+        Ok(result)
     }
 }
 
@@ -497,10 +533,8 @@ impl<'p> ExecExpr<'p> for ScalarFunction {
 
         if f_impl.volatility == Volatility::Stable {
             return match ctx.result_cache.borrow_mut().entry(f_impl.name.clone()) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    Ok(e.get().clone_ref(py).into_bound(py))
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
+                Entry::Occupied(e) => Ok(e.get().clone_ref(py).into_bound(py)),
+                Entry::Vacant(e) => {
                     let v = e.insert(f_impl.inner.call0(py)?);
                     Ok(v.clone_ref(py).into_bound(py))
                 }

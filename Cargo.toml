@@ -14,10 +14,8 @@ name = "sqc"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-fxhash = "0.2"
-ambassador = "0.4"
-derive_builder = "0.20"
 derive_more = { version = "0.99", default-features = false, features = ["display", "from", "error"] }
+fxhash = "0.2"
 indexmap = "2"
 itertools = "0.13"
 pyo3 = { version = "0.22", features = ["indexmap"] }
@@ -26,14 +24,9 @@ sqlparser = "0.48"
 [dev-dependencies]
 pyo3 = { version = "0.22", features = ["auto-initialize"] }
 rstest = "0.21"
-# serde = { version = "1", features = ["derive"] }
-# serde-pyobject = "0.3.0"
 
 [profile.release]
 opt-level = 3
 debug = false
 lto = true
 codegen-units = 1
-
-[profile.bench]
-debug = 1
