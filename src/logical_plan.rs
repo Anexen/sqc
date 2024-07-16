@@ -181,6 +181,7 @@ pub enum Expr {
     GetItem(GetItem),
     GetAttr(GetAttr),
     MethodCall(MethodCall),
+    Try(Try),
 }
 
 fn display_comma_separated_expr(exprs: &[Expr]) -> String {
@@ -299,6 +300,12 @@ impl fmt::Display for Wildcard {
     }
 }
 
+#[derive(Debug, Clone, Display)]
+#[display(fmt = "try({})", "display_comma_separated_expr(&self.args)")]
+pub struct Try {
+    pub args: Vec<Expr>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Display)]
 pub enum Operator {
     #[display(fmt = "+")]
@@ -395,6 +402,9 @@ impl Expr {
             }
             Expr::MethodCall(v) => {
                 v.input.extract_columns_impl(columns);
+                v.args.iter().for_each(|a| a.extract_columns_impl(columns));
+            }
+            Expr::Try(v) => {
                 v.args.iter().for_each(|a| a.extract_columns_impl(columns));
             }
         };

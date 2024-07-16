@@ -23,6 +23,24 @@ impl<'s, E> Stream<'s, E> {
     }
 }
 
+impl<'s> Stream<'s, PyErr> {
+    pub fn into_py_records(self, py: Python<'s>) -> PyResult<Vec<Bound<'s, PyDict>>> {
+        self.inner
+            .map_then(|row| {
+                if row.len() == 1 {
+                    Ok(row.into_values().next().unwrap())
+                } else {
+                    let result = PyDict::new_bound(py);
+                    for v in row.into_values() {
+                        result.update(v.as_mapping())?
+                    }
+                    Ok(result)
+                }
+            })
+            .collect()
+    }
+}
+
 impl<'s, E> Iterator for Stream<'s, E> {
     type Item = Result<Row<'s>, E>;
 

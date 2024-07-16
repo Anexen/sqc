@@ -11,12 +11,21 @@ macro_rules! query {
 #[macro_export]
 macro_rules! py_assert_eq {
     ($a:expr, $b:expr) => {
-        use ::pyo3::types::PyAnyMethods;
-
         ::pyo3::Python::with_gil(|py| {
+            use ::pyo3::types::PyAnyMethods;
+
             let a = &$a.into_bound(py);
             let b = &$b.into_bound(py);
             assert!(a.eq(b).unwrap(), "{} != {}", a, b)
+        })
+    };
+}
+
+#[macro_export]
+macro_rules! py_assert_is_instance {
+    ($value:expr, $cls:ident) => {
+        ::pyo3::Python::with_gil(|py| {
+            assert!($value.is_instance_of::<$cls>(py));
         })
     };
 }

@@ -1,10 +1,5 @@
-use itertools::Itertools;
 // use optimizer::Optimizer;
-use pyo3::{
-    create_exception,
-    prelude::*,
-    types::{IntoPyDict as _, PyDict},
-};
+use pyo3::{create_exception, exceptions::*, prelude::*, types::PyDict};
 
 #[macro_use]
 mod macros;
@@ -17,11 +12,9 @@ mod parser;
 mod planner;
 mod stream;
 
-pub use executor::{execute_plan, ExecutionContext};
-pub use parser::parse_query;
-pub use planner::prepare_plan;
+use executor::{execute_plan, ExecutionContext};
 
-create_exception!("sqc", SqcError, pyo3::exceptions::PyBaseException);
+create_exception!("sqc", SqcError, PyBaseException);
 create_exception!("sqc", ParserError, SqcError);
 create_exception!("sqc", PlannerError, SqcError);
 
@@ -33,7 +26,10 @@ impl From<parser::ParserError> for PyErr {
 
 impl From<planner::PlannerError> for PyErr {
     fn from(value: planner::PlannerError) -> Self {
-        PlannerError::new_err(value.to_string())
+        match value {
+            planner::PlannerError::NotImplemented(e) => PyNotImplementedError::new_err(e),
+            planner::PlannerError::SyntaxError(e) => PySyntaxError::new_err(e),
+        }
     }
 }
 
@@ -47,6 +43,7 @@ pub fn sqc(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(prepare, m)?)?;
     m.add_function(wrap_pyfunction!(explain_, m)?)?;
+
     Ok(())
 }
 
@@ -121,19 +118,11 @@ fn execute(
         };
     }
 
-    let result: Vec<_> = execute_plan(py, &plan.logical_plan, &mut ctx)?
-        .map_ok(|row| {
-            if row.len() == 1 {
-                row.into_values().next().unwrap()
-            } else {
-                row.into_values()
-                    .flat_map(|v| v.into_iter())
-                    .into_py_dict_bound(py)
-            }
-        })
-        .try_collect()?;
+    let result = execute_plan(py, &plan.logical_plan, &mut ctx)?
+        .into_py_records(py)?
+        .into_py(py);
 
-    Ok(result.into_py(py))
+    Ok(result)
 }
 
 fn try_extract_variables_from_scope(
@@ -141,14 +130,15 @@ fn try_extract_variables_from_scope(
     variables: &[String],
     ctx: &mut ExecutionContext,
 ) -> PyResult<()> {
-    let locals =
-        unsafe { Py::<PyDict>::from_borrowed_ptr_or_err(py, pyo3::ffi::PyEval_GetLocals()) }?;
+    let locals = unsafe {
+        let ptr = pyo3::ffi::PyEval_GetLocals();
+        Py::<PyDict>::from_borrowed_ptr_or_err(py, ptr)?.into_bound(py)
+    };
 
-    let globals =
-        unsafe { Py::<PyDict>::from_borrowed_ptr_or_err(py, pyo3::ffi::PyEval_GetGlobals()) }?;
-
-    let locals = locals.bind(py);
-    let globals = globals.bind(py);
+    let globals = unsafe {
+        let ptr = pyo3::ffi::PyEval_GetGlobals();
+        Py::<PyDict>::from_borrowed_ptr_or_err(py, ptr)?.into_bound(py)
+    };
 
     for name in variables {
         let _name = &name[1..];

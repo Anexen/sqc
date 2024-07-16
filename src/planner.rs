@@ -1,6 +1,6 @@
 use std::{any::Any, rc::Rc};
 
-use derive_more::{Display, Error, From};
+use derive_more::{Display, Error};
 use itertools::Itertools;
 use pyo3::{
     prelude::*,
@@ -15,9 +15,10 @@ use crate::stream::IndexMap;
 type PlanResult<T = LogicalPlan> = Result<T, PlannerError>;
 type EquijoinPredicate = (Expr, Expr);
 
-#[derive(Debug, Error, Display, From)]
+#[derive(Debug, Error, Display)]
 pub enum PlannerError {
     NotImplemented(#[error(not(source))] String),
+    SyntaxError(#[error(not(source))] String),
 }
 
 pub fn prepare_plan(query: &ast::Query) -> PlanResult<PreparedPlan> {
@@ -33,6 +34,12 @@ pub fn prepare_plan(query: &ast::Query) -> PlanResult<PreparedPlan> {
 pub struct PreparedPlan {
     pub logical_plan: Rc<LogicalPlan>,
     pub external_names: Vec<String>,
+}
+
+#[derive(PartialEq, Eq)]
+enum FunctionArgumentTypeOrdering {
+    Positional = 1,
+    Keyword = 2,
 }
 
 #[derive(Default)]
@@ -327,11 +334,27 @@ impl Visitor {
                     self.external_names.push(name.clone())
                 }
                 let (args, kwargs) = self.visit_function_arguments(&function.args)?;
-                Expr::ScalarFunction(ScalarFunction {
-                    name: Identifier::new(name),
-                    args,
-                    kwargs,
-                })
+                if name == "try" {
+                    if args.is_empty() {
+                        return Err(PlannerError::SyntaxError(
+                            "try() missing 1 required positional argument".to_string(),
+                        ));
+                    }
+
+                    if !kwargs.is_empty() {
+                        return Err(PlannerError::SyntaxError(
+                            "try() got an unexpected keyword argument".to_string(),
+                        ));
+                    }
+
+                    Expr::Try(Try { args })
+                } else {
+                    Expr::ScalarFunction(ScalarFunction {
+                        name: Identifier::new(name),
+                        args,
+                        kwargs,
+                    })
+                }
             }
             ast::Expr::IsDistinctFrom(left, right) => Expr::Binary(BinaryExpr {
                 left: Box::new(self.visit_expr(left)?),
@@ -367,7 +390,7 @@ impl Visitor {
                 input: Box::new(self.visit_expr(column)?),
                 keys: keys.iter().map(|k| self.visit_expr(&k.key)).try_collect()?,
             }),
-            _ => unimplemented!("{expr:?}"),
+            _ => return Err(PlannerError::NotImplemented(format!("{expr:?}"))),
         };
         Ok(result)
     }
@@ -376,6 +399,7 @@ impl Visitor {
         &mut self,
         args: &ast::FunctionArguments,
     ) -> PlanResult<(Vec<Expr>, IndexMap<Identifier, Expr>)> {
+        let mut ordering = FunctionArgumentTypeOrdering::Positional;
         let mut positional = Vec::new();
         let mut keyword = IndexMap::default();
 
@@ -386,12 +410,20 @@ impl Visitor {
                 for arg in arg_list.args.iter() {
                     match arg {
                         ast::FunctionArg::Named { name, arg, .. } => {
+                            if ordering == FunctionArgumentTypeOrdering::Positional {
+                                ordering = FunctionArgumentTypeOrdering::Keyword;
+                            };
                             keyword.insert(
                                 Identifier::new(name.to_string()),
                                 self.visit_function_arg_expr(arg)?,
                             );
                         }
                         ast::FunctionArg::Unnamed(arg) => {
+                            if ordering == FunctionArgumentTypeOrdering::Keyword {
+                                return Err(PlannerError::SyntaxError(
+                                    "positional argument follows keyword argument".to_string(),
+                                ));
+                            };
                             positional.push(self.visit_function_arg_expr(arg)?);
                         }
                     }

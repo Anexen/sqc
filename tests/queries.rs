@@ -68,7 +68,7 @@ fn test_join_multi(events: &PyObject, users: &PyObject, pull_requests: &PyObject
         ev.type = 'PullRequestEvent'
         AND ev.public
         AND ev.payload['action'] = 'opened'
-        AND pr.commits > 100
+        AND try(pr.commits, 0) > 100
     ORDER BY pr.title
     "#;
 

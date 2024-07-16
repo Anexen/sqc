@@ -3,8 +3,8 @@ use pyo3::prelude::*;
 mod datetime;
 mod iterable;
 mod math;
+mod nullable;
 mod strings;
-mod type_conversion;
 mod udf;
 
 pub use udf::ScalarUDF;
@@ -21,7 +21,7 @@ pub enum Volatility {
 
 macro_rules! udf {
     ($py:expr, $function:path) => {
-        ::pyo3::wrap_pyfunction!($function)($py)?.into()
+        ::pyo3::wrap_pyfunction_bound!($function, $py)?.into()
     };
 }
 
@@ -39,7 +39,15 @@ pub fn registry() -> PyResult<Vec<ScalarUDF>> {
         })
         .collect::<PyResult<_>>()?;
 
+        let null_if: PyObject = udf!(py, self::nullable::null_if);
+
         result.extend([
+            // nullable
+            ScalarUDF::immutable("coalesce", udf!(py, self::nullable::coalesce)),
+            ScalarUDF::immutable("null_if", null_if.clone_ref(py)),
+            ScalarUDF::immutable("nullif", null_if),
+            ScalarUDF::immutable("is_null", udf!(py, self::nullable::is_null)),
+            ScalarUDF::immutable("is_not_null", udf!(py, self::nullable::is_not_null)),
             // iterable
             ScalarUDF::immutable("empty", udf!(py, self::iterable::empty)),
             ScalarUDF::immutable("index_of", udf!(py, self::iterable::index_of)),

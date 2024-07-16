@@ -131,6 +131,7 @@ impl<'p> ExecExpr<'p> for Expr {
             Expr::GetItem(v) => v.execute(py, ctx, row),
             Expr::GetAttr(v) => v.execute(py, ctx, row),
             Expr::MethodCall(v) => v.execute(py, ctx, row),
+            Expr::Try(v) => v.execute(py, ctx, row),
         }
     }
 }
@@ -326,9 +327,13 @@ impl<'p> Exec<'p> for Filter {
 
 impl<'p> Exec<'p> for EmptyRelation {
     fn execute(&'p self, py: Python<'p>, _ctx: &'p ExecutionContext) -> PyResult<Stream<'p>> {
-        let table_ref = TableReference::default();
-        let row = IndexMap::from_iter([(table_ref, PyDict::new_bound(py))]);
-        let data = vec![Ok(row)];
+        let data = if self.produce_one_row {
+            let table_ref = TableReference::default();
+            let row = IndexMap::from_iter([(table_ref, PyDict::new_bound(py))]);
+            vec![Ok(row)]
+        } else {
+            vec![]
+        };
         Ok(Stream::new(data))
     }
 }
@@ -423,13 +428,15 @@ impl<'p> ExecExpr<'p> for Column {
                 }
             }
         };
+
         let part = row
             .get(table_ref)
             .ok_or_else(|| NameError!("table `{}` is not defined", table_ref))?;
 
         match part.get_item(&self.name)? {
             Some(x) => Ok(x),
-            None => Ok(py.None().into_bound(py)),
+            // None => Ok(py.None().into_bound(py)),
+            None => Err(NameError!("column `{}` is not defined", self.name)),
         }
     }
 }
@@ -682,5 +689,22 @@ impl<'p> ExecExpr<'p> for GetAttr {
         }
 
         Ok(input)
+    }
+}
+
+impl<'p> ExecExpr<'p> for Try {
+    fn execute(
+        &'p self,
+        py: Python<'p>,
+        ctx: &'p ExecutionContext,
+        row: &'p Row,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        for input in self.args.iter() {
+            let result = input.execute(py, ctx, row);
+            if result.is_ok() {
+                return result;
+            }
+        }
+        Ok(py.None().into_bound(py))
     }
 }

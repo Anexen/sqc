@@ -1,4 +1,4 @@
-use pyo3::{exceptions::*, Python};
+use pyo3::exceptions::*;
 
 use rstest::*;
 
@@ -113,16 +113,14 @@ fn test_tuples() {
 
 #[rstest]
 fn test_tuple_errors() {
-    Python::with_gil(|py| {
-        let result = query!("select (1,) + [1]").unwrap_err();
-        result.is_instance_of::<PyTypeError>(py);
+    let result = query!("select (1,) + [1]").unwrap_err();
+    py_assert_is_instance!(result, PyTypeError);
 
-        let result = query!("select tuple(1, 2)").unwrap_err();
-        result.is_instance_of::<PyTypeError>(py);
+    let result = query!("select tuple(1, 2)").unwrap_err();
+    py_assert_is_instance!(result, PyTypeError);
 
-        let result = query!("select (1, 2) < False").unwrap_err();
-        result.is_instance_of::<PyTypeError>(py);
-    });
+    let result = query!("select (1, 2) < False").unwrap_err();
+    py_assert_is_instance!(result, PyTypeError);
 }
 
 #[rstest]
@@ -138,6 +136,7 @@ fn test_dictionaries() {
         len({'a': 1, 'b': 2}) as len,
         dict([(1, (2, [False][1])), (3, {4: 5})]) as constructor,
         list({'a': 1, 'B': 2} -> keys()) as keys,
+        dict(a=1, b=[{'c': 3}]) as kwargs,
     "#;
 
     let result = query!(query).unwrap();
@@ -152,7 +151,21 @@ fn test_dictionaries() {
         "len": 2,
         "constructor": {1: (2, None), 3: {4: 5}},
         "keys": ["a", "B"],
+        "kwargs": {"a": 1, "b": [{"c": 3}]},
     }]);
 
     py_assert_eq!(result, expected);
+}
+
+#[rstest]
+fn test_keyword_arguments() {
+    let result = query!("select dict(a=1) as d").unwrap();
+    py_assert_eq!(result, py!([{"d": {"a": 1}}]));
+
+    let result = query!("select dict(a=1, [(b, 2)])").unwrap_err();
+    // positional argument follows keyword argument
+    py_assert_is_instance!(result, PySyntaxError);
+
+    let result = query!("select dict([('b', 2)], a=1) as d").unwrap();
+    py_assert_eq!(result, py!([{"d": {"a": 1, "b": 2}}]));
 }
